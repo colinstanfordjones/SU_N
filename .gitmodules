@@ -1,0 +1,9 @@
+[submodule "external/onnxruntime"]
+	path = external/onnxruntime
+	url = https://github.com/microsoft/onnxruntime.git
+[submodule "external/faiss"]
+	path = external/faiss
+	url = https://github.com/facebookresearch/faiss.git
+[submodule "external/mpich"]
+	path = external/mpich
+	url = https://github.com/pmodels/mpich

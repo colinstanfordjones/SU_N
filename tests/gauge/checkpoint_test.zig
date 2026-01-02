@@ -14,7 +14,6 @@ test "GaugeTree - checkpoint roundtrip with links" {
     const GaugeTree = gauge.GaugeTree(Frontend);
     const Arena = amr.FieldArena(Frontend);
     const Complex = std.math.Complex(f64);
-    const Link = Frontend.LinkType;
 
     var tree = try GaugeTree.init(std.testing.allocator, 0.25, 4, 8);
     defer tree.deinit();
@@ -29,14 +28,14 @@ test "GaugeTree - checkpoint roundtrip with links" {
         val.* = .{Complex.init(@as(f64, @floatFromInt(i)), -0.5)};
     }
 
-    for (tree.links.items, 0..) |link_slice, block_idx| {
-        for (link_slice, 0..) |*link, link_idx| {
-            var out = Link.identity();
-            out.matrix.data[0][0] = Complex.init(
-                @as(f64, @floatFromInt(block_idx * 100 + link_idx)),
-                @as(f64, @floatFromInt(link_idx)) * 0.01,
-            );
-            link.* = out;
+    // Set random links
+    const HaarSampler = gauge.haar.HaarSampler(GaugeTree.LinkType.dim);
+    var sampler = HaarSampler.init(1234);
+    
+    for (0..tree.blockCount()) |block_idx| {
+        const link_slice = tree.getBlockLinksMut(block_idx).?;
+        for (link_slice) |*link| {
+            link.* = sampler.sample();
         }
     }
 
@@ -64,8 +63,10 @@ test "GaugeTree - checkpoint roundtrip with links" {
     try expectBytesEqual(tree.tree.blocks.items, restored_tree.tree.blocks.items);
     try expectBytesEqual(arena.storage, restored_arena.storage);
 
-    try std.testing.expectEqual(tree.links.items.len, restored_tree.links.items.len);
-    for (tree.links.items, restored_tree.links.items) |lhs, rhs| {
+    try std.testing.expectEqual(tree.blockCount(), restored_tree.blockCount());
+    for (0..tree.blockCount()) |block_idx| {
+        const lhs = tree.getBlockLinksConst(block_idx).?;
+        const rhs = restored_tree.getBlockLinksConst(block_idx).?;
         try expectBytesEqual(lhs, rhs);
     }
 }

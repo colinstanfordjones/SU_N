@@ -110,7 +110,7 @@ fn setupAMR(allocator: std.mem.Allocator) !struct {
     h: HAMR,
 } {
     var tree_ptr = try allocator.create(GT);
-    tree_ptr.* = try GT.init(allocator, 1.0, 2);
+    tree_ptr.* = try GT.init(allocator, 1.0, 2, 8);
     const block_idx = try tree_ptr.insertBlock(.{ 0, 0, 0, 0 }, 0);
 
     var psi_ptr = try allocator.create(Arena);
@@ -225,12 +225,12 @@ const HMCBenchState = struct {
         // Allocate force buffer (AlgebraBuffer)
         var forces = try allocator.create(Force.AlgebraBuffer);
         forces.* = Force.AlgebraBuffer.init(allocator, n_blocks);
-        try forces.ensureBlocks(tree_ptr.links.items.len);
+        try forces.ensureBlocks(n_blocks);
 
         // Allocate momentum buffer
         var momenta = try allocator.create(Force.AlgebraBuffer);
         momenta.* = Force.AlgebraBuffer.init(allocator, n_blocks);
-        try momenta.ensureBlocks(tree_ptr.links.items.len);
+        try momenta.ensureBlocks(n_blocks);
 
         return .{
             .tree = tree_ptr,
@@ -337,7 +337,7 @@ fn runHydrogenGroundStateAMR(max_steps: usize) HydrogenResult {
     const grid_dim = 2;
     
     var tree_ptr = allocator.create(GT) catch @panic("OOM");
-    tree_ptr.* = GT.init(allocator, spacing, 2) catch @panic("OOM");
+    tree_ptr.* = GT.init(allocator, spacing, 2, 8) catch @panic("OOM");
 
     var psi_ptr = allocator.create(Arena) catch @panic("OOM");
     psi_ptr.* = Arena.init(allocator, 32) catch @panic("OOM");

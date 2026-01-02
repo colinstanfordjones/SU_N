@@ -296,47 +296,31 @@ pub fn AMRForce(comptime Frontend: type) type {
             mu: usize,
             beta: f64,
         ) Force {
-            const u = tree.getLink(block_idx, site_idx, mu);
-            const staple = tree.computeStapleRuntime(block_idx, site_idx, mu);
-            const u_staple = u.mul(staple);
-            const force = projectToAlgebra(u_staple.matrix);
-            return force.scale(-beta / @as(f64, N_gauge));
+            var result = Force.zero();
+            inline for (0..Nd) |mu_idx| {
+                if (mu == mu_idx) {
+                    result = computeLocalForce(tree, block_idx, site_idx, mu_idx, beta);
+                }
+            }
+            return result;
         }
 
         /// Kernel for parallel force computation
         const ForceKernel = struct {
             tree: *GaugeTree,
+            forces: *AlgebraBuffer,
             beta: f64,
 
-            pub fn ghostPrepare(self: *ForceKernel) !bool {
-                return try self.tree.prepareLinkGhostExchange();
-            }
-
-            pub fn ghostPull(self: *ForceKernel, block_idx: usize) void {
-                self.tree.fillGhostsPull(block_idx);
-            }
-
-            pub fn ghostPush(self: *ForceKernel, block_idx: usize) void {
-                self.tree.fillGhostsPush(block_idx);
-            }
-
-            pub fn ghostFinalize(self: *ForceKernel) void {
-                self.tree.finalizeLinkGhostExchange();
-            }
-
+            /// Execute kernel on a block using ApplyContext
             pub fn execute(
-                self: *ForceKernel,
+                self: *const ForceKernel,
                 block_idx: usize,
                 _: *const Block,
-                _: anytype, // inputs (void)
-                outputs: anytype, // forces: *AlgebraBuffer
-                _: ?*amr.GhostBuffer(Frontend), // ghosts (null)
-                _: ?*amr.FluxRegister(amr.AMRTree(Frontend)),
+                _: *amr.ApplyContext(Frontend),
             ) void {
-                const forces = outputs;
-                if (block_idx >= forces.slices.items.len) return;
+                if (block_idx >= self.forces.slices.items.len) return;
 
-                const force_slice = forces.slices.items[block_idx];
+                const force_slice = self.forces.slices.items[block_idx];
                 for (0..Block.volume) |site| {
                     for (0..Nd) |mu| {
                         const force_idx = site * Nd + mu;
@@ -345,30 +329,6 @@ pub fn AMRForce(comptime Frontend: type) type {
                         }
                     }
                 }
-            }
-
-            pub fn executeInterior(
-                self: *ForceKernel,
-                block_idx: usize,
-                block: *const Block,
-                inputs: anytype,
-                outputs: anytype,
-                ghosts: ?*amr.GhostBuffer(Frontend),
-                flux_reg: ?*amr.FluxRegister(amr.AMRTree(Frontend)),
-            ) void {
-                self.execute(block_idx, block, inputs, outputs, ghosts, flux_reg);
-            }
-
-            pub fn executeBoundary(
-                self: *ForceKernel,
-                block_idx: usize,
-                block: *const Block,
-                inputs: anytype,
-                outputs: anytype,
-                ghosts: ?*amr.GhostBuffer(Frontend),
-                flux_reg: ?*amr.FluxRegister(amr.AMRTree(Frontend)),
-            ) void {
-                self.execute(block_idx, block, inputs, outputs, ghosts, flux_reg);
             }
         };
 
@@ -379,10 +339,16 @@ pub fn AMRForce(comptime Frontend: type) type {
             beta: f64,
         ) !usize {
             // Ensure force buffer has enough blocks
-            try forces.ensureBlocks(tree.links.items.len);
+            try forces.ensureBlocks(tree.tree.blocks.items.len);
 
-            var kernel = ForceKernel{ .tree = tree, .beta = beta };
-            try tree.tree.apply(&kernel, {}, forces, null, null);
+            // Fill link ghosts before force computation
+            try tree.fillGhosts();
+
+            var kernel = ForceKernel{ .tree = tree, .forces = forces, .beta = beta };
+
+            // Build ApplyContext (no field data, just tree reference)
+            var ctx = amr.ApplyContext(Frontend).init(&tree.tree);
+            try tree.tree.apply(&kernel, &ctx);
 
             // Accumulate transmitted forces at refinement boundaries
             accumulateTransmittedForces(tree, forces, beta);
@@ -558,9 +524,11 @@ pub fn AMRForce(comptime Frontend: type) type {
             momenta: *const AlgebraBuffer,
             dt: f64,
         ) void {
-            for (tree.links.items, 0..) |links, idx| {
+            for (tree.tree.blocks.items, 0..) |*block, idx| {
+                if (block.block_index == std.math.maxInt(usize)) continue;
                 if (idx >= momenta.slices.items.len) continue;
                 const mom_slice = momenta.slices.items[idx];
+                const links = tree.getBlockLinksMut(idx) orelse continue;
 
                 for (0..Block.volume) |site| {
                     inline for (0..Nd) |mu| {

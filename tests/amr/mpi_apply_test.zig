@@ -22,6 +22,7 @@ test "mpi apply matches reference across refinement boundary" {
     const Arena = amr.FieldArena(Frontend);
     const Ghosts = amr.GhostBuffer(Frontend);
     const Block = amr.AMRBlock(Frontend);
+    const ApplyContext = amr.ApplyContext(Frontend);
 
     const coarse_origin = .{ 0, 0 };
     const fine_origin0 = .{ block_size * 2, 0 };
@@ -92,76 +93,65 @@ test "mpi apply matches reference across refinement boundary" {
     defer ref_ghosts.deinit();
 
     const Kernel = struct {
-        tree: *const Tree,
+        tree_ref: *const Tree,
 
-        pub fn executeInterior(
-            self: *@This(),
+        pub fn execute(
+            self: *const @This(),
             block_idx: usize,
             _: *const Block,
-            inputs: *Arena,
-            outputs: *Arena,
-            _: ?*Ghosts,
-            flux_reg: ?*Tree.FluxRegister,
+            ctx: *ApplyContext,
         ) void {
-            _ = flux_reg;
-            const slot = self.tree.getFieldSlot(block_idx);
+            const slot = self.tree_ref.getFieldSlot(block_idx);
             if (slot == std.math.maxInt(usize)) return;
+
+            const inputs = ctx.field_in orelse return;
+            const outputs = ctx.field_out orelse return;
 
             const in_field = inputs.getSlotConst(slot);
             const out_field = outputs.getSlot(slot);
 
-            for (in_field, 0..) |val, i| {
-                const coords = Block.getLocalCoords(i);
-                if (Block.isOnBoundary(coords)) continue;
-                out_field[i] = val + 1.0;
-            }
-        }
-
-        pub fn executeBoundary(
-            self: *@This(),
-            block_idx: usize,
-            _: *const Block,
-            inputs: *Arena,
-            outputs: *Arena,
-            ghosts_opt: ?*Ghosts,
-            flux_reg: ?*Tree.FluxRegister,
-        ) void {
-            _ = flux_reg;
-            const slot = self.tree.getFieldSlot(block_idx);
-            if (slot == std.math.maxInt(usize)) return;
-
-            const in_field = inputs.getSlotConst(slot);
-            const out_field = outputs.getSlot(slot);
-
-            const ghost_faces = if (ghosts_opt) |g| g.get(block_idx) orelse return else return;
+            const ghost_faces = if (ctx.field_ghosts) |g| g.get(block_idx) else null;
 
             for (in_field, 0..) |val, i| {
                 const coords = Block.getLocalCoords(i);
-                if (!Block.isOnBoundary(coords)) continue;
+                if (Block.isOnBoundary(coords)) {
+                    // Boundary cell - use ghost data
+                    var ghost_sum: f64 = 0.0;
+                    if (ghost_faces) |gf| {
+                        for (0..Block.num_ghost_faces) |face| {
+                            const dim = face / 2;
+                            const is_positive = (face % 2) == 0;
+                            if (is_positive and coords[dim] != Block.size - 1) continue;
+                            if (!is_positive and coords[dim] != 0) continue;
 
-                var ghost_sum: f64 = 0.0;
-                for (0..Block.num_ghost_faces) |face| {
-                    const dim = face / 2;
-                    const is_positive = (face % 2) == 0;
-                    if (is_positive and coords[dim] != Block.size - 1) continue;
-                    if (!is_positive and coords[dim] != 0) continue;
-
-                    const ghost_idx = Block.getGhostIndexRuntime(coords, face);
-                    ghost_sum += ghost_faces[face][ghost_idx];
+                            const ghost_idx = Block.getGhostIndexRuntime(coords, face);
+                            ghost_sum += gf[face][ghost_idx];
+                        }
+                    }
+                    out_field[i] = val + ghost_sum;
+                } else {
+                    // Interior cell
+                    out_field[i] = val + 1.0;
                 }
-
-                out_field[i] = val + ghost_sum;
             }
         }
     };
 
-    var kernel_ref = Kernel{ .tree = &ref_tree };
-    var kernel_local = Kernel{ .tree = &tree };
+    var kernel_ref = Kernel{ .tree_ref = &ref_tree };
+    var kernel_local = Kernel{ .tree_ref = &tree };
 
-    try ref_tree.apply(&kernel_ref, &ref_in, &ref_out, &ref_ghosts, null);
+    var ref_ctx = ApplyContext.init(&ref_tree);
+    ref_ctx.field_in = &ref_in;
+    ref_ctx.field_out = &ref_out;
+    ref_ctx.field_ghosts = &ref_ghosts;
+    try ref_tree.apply(&kernel_ref, &ref_ctx);
 
-    // 2. Parallel tree
-    try tree.apply(&kernel_local, &arena_in, &arena_out, &ghosts, null);
+    // Parallel tree
+    var ctx = ApplyContext.init(&tree);
+    ctx.field_in = &arena_in;
+    ctx.field_out = &arena_out;
+    ctx.field_ghosts = &ghosts;
+    try tree.apply(&kernel_local, &ctx);
 
     for (tree.blocks.items, 0..) |*block, idx| {
         if (block.block_index == std.math.maxInt(usize)) continue;
@@ -179,10 +169,10 @@ test "mpi apply matches reference across refinement boundary" {
     }
 }
 
-fn fillFields(comptime Tree: type, tree: *const Tree, arena: *Tree.FieldArenaType) void {
-    for (tree.blocks.items, 0..) |*block, idx| {
+fn fillFields(comptime Tree: type, tree_ptr: *const Tree, arena: *Tree.FieldArenaType) void {
+    for (tree_ptr.blocks.items, 0..) |*block, idx| {
         if (block.block_index == std.math.maxInt(usize)) continue;
-        const slot = tree.getFieldSlot(idx);
+        const slot = tree_ptr.getFieldSlot(idx);
         if (slot == std.math.maxInt(usize)) continue;
 
         const data = arena.getSlot(slot);

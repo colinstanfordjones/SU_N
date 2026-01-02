@@ -6,20 +6,25 @@ const std = @import("std");
 const amr = @import("amr");
 const dist_exchange = @import("amr").dist_exchange;
 
-pub fn LinkGhostPolicy(comptime GaugeTree: type) type {
-    const Tree = GaugeTree.TreeType;
+pub fn LinkGhostPolicy(comptime GaugeField: type) type {
+    const Frontend = GaugeField.FrontendType;
+    const Tree = GaugeField.TreeType;
     const Block = Tree.BlockType;
-    const Link = GaugeTree.LinkType;
+    const Link = GaugeField.LinkType;
     const Nd = Tree.dimensions;
-    const Frontend = GaugeTree.FrontendType;
     const LinkOps = Frontend.LinkOperators;
+    const LinkArena = GaugeField.LinkArena;
+    const LinkGhostFaces = GaugeField.LinkGhostFaces;
 
     return struct {
         pub const Payload = Link;
         
-        /// Context for Link exchange is the GaugeTree itself
+        /// Context for Link exchange
         pub const Context = struct {
-            tree: *const GaugeTree,
+            tree: *const Tree,
+            arena: *const LinkArena,
+            ghosts: []?*LinkGhostFaces,
+            slots: []const usize,
         };
         pub const ExchangeSpec = dist_exchange.ExchangeSpec(Context, Payload);
 
@@ -44,10 +49,13 @@ pub fn LinkGhostPolicy(comptime GaugeTree: type) type {
 
         pub fn packSameLevel(ctx: Context, block_idx: usize, face: usize, dest: []Payload, scratch: std.mem.Allocator) void {
             _ = scratch;
-            const links = ctx.tree.getBlockLinksConst(block_idx) orelse {
+            if (block_idx >= ctx.slots.len) return;
+            const slot = ctx.slots[block_idx];
+            if (slot == std.math.maxInt(usize)) {
                 @memset(dest, Link.identity());
                 return;
-            };
+            }
+            const links = ctx.arena.getSlotConst(slot);
 
             var offset: usize = 0;
             inline for (0..Nd) |link_dim| {
@@ -58,10 +66,13 @@ pub fn LinkGhostPolicy(comptime GaugeTree: type) type {
         }
 
         pub fn packFineToCoarse(ctx: Context, block_idx: usize, face: usize, dest: []Payload, scratch: std.mem.Allocator) void {
-            const links = ctx.tree.getBlockLinksConst(block_idx) orelse {
+            if (block_idx >= ctx.slots.len) return;
+            const slot = ctx.slots[block_idx];
+            if (slot == std.math.maxInt(usize)) {
                 @memset(dest, Link.zero());
                 return;
-            };
+            }
+            const links = ctx.arena.getSlotConst(slot);
             const block = ctx.tree.getBlock(block_idx).?;
 
             var offset: usize = 0;
@@ -85,8 +96,8 @@ pub fn LinkGhostPolicy(comptime GaugeTree: type) type {
         }
 
         pub fn unpackSameLevel(ctx: Context, block_idx: usize, face: usize, src: []const Payload) void {
-            if (block_idx >= ctx.tree.ghosts.items.len) return;
-            const ghost = &ctx.tree.ghosts.items[block_idx];
+            if (block_idx >= ctx.ghosts.len) return;
+            const ghost = ctx.ghosts[block_idx] orelse return;
             
             var offset: usize = 0;
             inline for (0..Nd) |link_dim| {
@@ -97,8 +108,8 @@ pub fn LinkGhostPolicy(comptime GaugeTree: type) type {
         }
 
         pub fn unpackCoarseToFine(ctx: Context, block_idx: usize, face: usize, src: []const Payload) void {
-            if (block_idx >= ctx.tree.ghosts.items.len) return;
-            const ghost = &ctx.tree.ghosts.items[block_idx];
+            if (block_idx >= ctx.ghosts.len) return;
+            const ghost = ctx.ghosts[block_idx] orelse return;
             const block = ctx.tree.getBlock(block_idx).?;
 
             var offset: usize = 0;
@@ -112,8 +123,8 @@ pub fn LinkGhostPolicy(comptime GaugeTree: type) type {
         }
 
         pub fn unpackFineToCoarse(ctx: Context, block_idx: usize, face: usize, src: []const Payload) void {
-            if (block_idx >= ctx.tree.ghosts.items.len) return;
-            const ghost = &ctx.tree.ghosts.items[block_idx];
+            if (block_idx >= ctx.ghosts.len) return;
+            const ghost = ctx.ghosts[block_idx] orelse return;
 
             var offset: usize = 0;
             inline for (0..Nd) |link_dim| {

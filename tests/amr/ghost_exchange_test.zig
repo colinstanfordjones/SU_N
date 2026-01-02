@@ -55,9 +55,9 @@ test "ghost exchange begin/finish matches bulk fill" {
     try ghosts_split.ensureForTree(&tree);
 
     const ghost_len = tree.blocks.items.len;
-    amr.ghost.fillGhostLayers(Tree, &tree, &arena, ghosts_bulk.slice(ghost_len));
-    amr.ghost.beginGhostExchange(Tree, &tree, &arena, ghosts_split.slice(ghost_len));
-    amr.ghost.finishGhostExchange(Tree, &tree, &arena, ghosts_split.slice(ghost_len));
+    try tree.fillGhostLayers(&arena, ghosts_bulk.slice(ghost_len));
+    var split_state = try tree.beginGhostExchange(&arena, ghosts_split.slice(ghost_len));
+    try tree.finishGhostExchange(&split_state);
 
     for (tree.blocks.items, 0..) |*block, idx| {
         if (block.block_index == std.math.maxInt(usize)) continue;
@@ -131,7 +131,7 @@ test "ghost exchange uses custom exchange spec for local fills" {
     try ghosts.ensureForTree(&tree);
 
     const ghost_len = tree.blocks.items.len;
-    amr.ghost.fillGhostLayers(Tree, &tree, &arena, ghosts.slice(ghost_len));
+    try tree.fillGhostLayers(&arena, ghosts.slice(ghost_len));
 
     const left_faces = ghosts.get(0) orelse return error.TestExpectedEqual;
     const right_faces = ghosts.get(1) orelse return error.TestExpectedEqual;

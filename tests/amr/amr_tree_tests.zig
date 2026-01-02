@@ -7,7 +7,6 @@ const gauge = @import("gauge");
 
 const AMRTree = amr.tree.AMRTree;
 const FieldArena = amr.field_arena.FieldArena;
-const ghost = amr.ghost;
 const adaptation = amr.adaptation;
 
 const Complex = std.math.Complex(f64);
@@ -203,6 +202,7 @@ test "AMRTree ghost layer filling same level" {
     const Frontend = ComplexArrayFrontend(N, 4);
     const Tree = AMRTree(Frontend);
     const Arena = FieldArena(Frontend);
+    const GhostBuffer = amr.GhostBuffer(Frontend);
 
     var tree = try Tree.init(std.testing.allocator, 1.0, 2, 8);
     defer tree.deinit();
@@ -221,19 +221,21 @@ test "AMRTree ghost layer filling same level" {
     tree.assignFieldSlot(b1, slot1);
 
     // Fill with distinct Complex values
-    const Block = Tree.BlockType;
     const field0 = arena.getSlot(slot0);
     const field1 = arena.getSlot(slot1);
     for (field0) |*v| v.*[0] = Complex.init(1.0, 0.5);
     for (field1) |*v| v.*[0] = Complex.init(2.0, 1.0);
 
-    // Ghost layer storage for all blocks
-    var ghosts0: [8][Block.ghost_face_size][N]Complex = undefined;
-    var ghosts1: [8][Block.ghost_face_size][N]Complex = undefined;
-    var all_ghosts = [_]?*[8][Block.ghost_face_size][N]Complex{ &ghosts0, &ghosts1 };
+    // Ghost layer storage using GhostBuffer
+    var ghosts = try GhostBuffer.init(std.testing.allocator, 4);
+    defer ghosts.deinit();
+    try ghosts.ensureForTree(&tree);
 
     // Fill ghost layers for all blocks at once
-    ghost.fillGhostLayers(Tree, &tree, &arena, &all_ghosts);
+    try tree.fillGhostLayers(&arena, ghosts.slice(tree.blocks.items.len));
+
+    // Get ghost faces for block 0
+    const ghosts0 = ghosts.get(b0) orelse return error.TestExpectedEqual;
 
     // The +t ghost of block 0 should contain values from block 1's -t boundary
     // Block 1 has value (2.0, 1.0) everywhere

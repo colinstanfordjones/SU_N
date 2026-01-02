@@ -21,6 +21,7 @@ const Frontend = gauge.GaugeFrontend(1, 1, Nd, block_size, TestTopology);
 const Tree = amr.AMRTree(Frontend);
 const FieldArena = amr.FieldArena(Frontend);
 const GhostBuffer = amr.GhostBuffer(Frontend);
+const ApplyContext = amr.ApplyContext(Frontend);
 const MG = amr.multigrid.Multigrid(Tree);
 
 const CountingAllocator = struct {
@@ -83,56 +84,16 @@ const PoissonKernel = struct {
     tree: *const Tree,
     const Block = Tree.BlockType;
 
-    pub fn executeInterior(
+    pub fn execute(
         self: *const PoissonKernel,
         block_idx: usize,
         block: *const Tree.BlockType,
-        psi_in: *const FieldArena,
-        psi_out: *FieldArena,
-        ghosts: ?*GhostBuffer,
-        flux_reg: ?*Tree.FluxRegister,
-    ) void {
-        _ = ghosts;
-        _ = flux_reg;
-        const slot = self.tree.getFieldSlot(block_idx);
-        const in = psi_in.getSlotConst(slot);
-        const out = psi_out.getSlot(slot);
-
-        const h_inv_sq = 1.0 / (block.spacing * block.spacing);
-
-        for (0..Tree.BlockType.volume) |site| {
-            _ = Tree.BlockType.getLocalCoords(site);
-            var sum = Complex.init(0, 0);
-
-            inline for (0..Tree.dimensions) |d| {
-                const neighbor_plus = Tree.BlockType.localNeighborFast(site, d * 2);
-                const neighbor_minus = Tree.BlockType.localNeighborFast(site, d * 2 + 1);
-
-                // Get values, handling array type [1]Complex
-                const val_plus = in[neighbor_plus][0];
-                const val_minus = in[neighbor_minus][0];
-
-                sum = sum.add(val_plus).add(val_minus);
-            }
-
-            const val_center = in[site][0];
-            sum = sum.sub(val_center.mul(Complex.init(2.0 * @as(f64, @floatFromInt(Tree.dimensions)), 0)));
-
-            // h_inv_sq is f64, wrap in Complex
-            out[site][0] = sum.mul(Complex.init(h_inv_sq, 0));
-        }
-    }
-
-    pub fn executeBoundary(
-        self: *const PoissonKernel,
-        block_idx: usize,
-        block: *const Tree.BlockType,
-        psi_in: *const FieldArena,
-        psi_out: *FieldArena,
-        ghosts: ?*GhostBuffer,
-        flux_reg: ?*Tree.FluxRegister,
+        ctx: *ApplyContext,
     ) void {
         const slot = self.tree.getFieldSlot(block_idx);
+        const psi_in = ctx.field_in orelse return;
+        const psi_out = ctx.field_out orelse return;
+
         const in = psi_in.getSlotConst(slot);
         const out = psi_out.getSlot(slot);
 
@@ -140,7 +101,7 @@ const PoissonKernel = struct {
         const h_inv = 1.0 / h;
         const h_inv_sq = h_inv * h_inv;
 
-        // Iterate over faces to find C-F boundaries
+        // Check for C-F boundaries and add flux
         inline for (0..2 * Tree.dimensions) |face| {
             const neighbor = self.tree.neighborInfo(block_idx, face);
 
@@ -149,8 +110,7 @@ const PoissonKernel = struct {
 
                 if (is_coarse_boundary) {
                     // We are Fine. Neighbor is Coarse.
-                    // Compute flux and addFine.
-                    if (flux_reg) |fr| {
+                    if (ctx.flux_reg) |fr| {
                         self.computeAndAddFlux(fr, block_idx, block, in, face, h, true);
                     }
                 }
@@ -160,50 +120,66 @@ const PoissonKernel = struct {
                 const count = self.tree.collectFineNeighbors(block_idx, face, &fine_neighbors);
                 if (count > 0) {
                     // We are Coarse. Neighbor is Fine.
-                    // Compute flux and addCoarse.
-                    if (flux_reg) |fr| {
+                    if (ctx.flux_reg) |fr| {
                         self.computeAndAddFlux(fr, block_idx, block, in, face, h, false);
                     }
                 }
             }
         }
 
-        // Standard boundary update (dirichlet 0 for ghost)
+        // Compute Laplacian for all cells
         for (0..Tree.BlockType.volume) |site| {
             const coords = Tree.BlockType.getLocalCoords(site);
-            if (!Tree.BlockType.isOnBoundary(coords)) continue;
-
-            // Re-compute sum for boundary cells
             var sum = Complex.init(0, 0);
 
             inline for (0..Tree.dimensions) |d| {
-                const neighbor_plus = Tree.BlockType.localNeighborFast(site, d * 2);
-                const neighbor_minus = Tree.BlockType.localNeighborFast(site, d * 2 + 1);
+                var val_plus: Complex = undefined;
+                var val_minus: Complex = undefined;
 
-                var val_plus = in[neighbor_plus][0];
-                var val_minus = in[neighbor_minus][0];
-
+                // Handle boundary cells with ghost data
                 if (coords[d] == Tree.BlockType.size - 1) {
-                    if (ghosts) |g| {
-                        if (g.get(block_idx)) |gp| {
+                    if (ctx.field_ghosts) |ghosts| {
+                        if (ghosts.get(block_idx)) |gp| {
                             const idx = Tree.BlockType.getGhostIndexRuntime(coords, d * 2);
-                            if (idx < gp[d * 2].len)
+                            if (idx < gp[d * 2].len) {
                                 val_plus = gp[d * 2][idx][0];
+                            } else {
+                                val_plus = Complex.init(0, 0);
+                            }
+                        } else {
+                            val_plus = Complex.init(0, 0);
                         }
+                    } else {
+                        val_plus = Complex.init(0, 0);
                     }
+                } else {
+                    const neighbor_plus = Tree.BlockType.localNeighborFast(site, d * 2);
+                    val_plus = in[neighbor_plus][0];
                 }
+
                 if (coords[d] == 0) {
-                    if (ghosts) |g| {
-                        if (g.get(block_idx)) |gp| {
+                    if (ctx.field_ghosts) |ghosts| {
+                        if (ghosts.get(block_idx)) |gp| {
                             const idx = Tree.BlockType.getGhostIndexRuntime(coords, d * 2 + 1);
-                            if (idx < gp[d * 2 + 1].len)
+                            if (idx < gp[d * 2 + 1].len) {
                                 val_minus = gp[d * 2 + 1][idx][0];
+                            } else {
+                                val_minus = Complex.init(0, 0);
+                            }
+                        } else {
+                            val_minus = Complex.init(0, 0);
                         }
+                    } else {
+                        val_minus = Complex.init(0, 0);
                     }
+                } else {
+                    const neighbor_minus = Tree.BlockType.localNeighborFast(site, d * 2 + 1);
+                    val_minus = in[neighbor_minus][0];
                 }
 
                 sum = sum.add(val_plus).add(val_minus);
             }
+
             const val_center = in[site][0];
             sum = sum.sub(val_center.mul(Complex.init(2.0 * @as(f64, @floatFromInt(Tree.dimensions)), 0)));
             out[site][0] = sum.mul(Complex.init(h_inv_sq, 0));
@@ -373,7 +349,12 @@ test "Poisson - Apply Laplacian with wiring" {
     defer flux_reg.deinit();
 
     const kernel = PoissonKernel{ .tree = &tree };
-    try tree.apply(&kernel, &arena_in, &arena_out, &ghosts, &flux_reg);
+    var ctx = ApplyContext.init(&tree);
+    ctx.field_in = &arena_in;
+    ctx.field_out = &arena_out;
+    ctx.field_ghosts = &ghosts;
+    ctx.flux_reg = &flux_reg;
+    try tree.apply(&kernel, &ctx);
 }
 
 test "FluxRegister - Accumulation at C-F interface" {
@@ -384,42 +365,18 @@ test "FluxRegister - Accumulation at C-F interface" {
     const OpenTree = amr.AMRTree(OpenFrontend);
     const OpenArena = amr.FieldArena(OpenFrontend);
     const OpenGhost = amr.GhostBuffer(OpenFrontend);
+    const OpenApplyContext = amr.ApplyContext(OpenFrontend);
     const OpenKernel = struct {
         tree: *const OpenTree,
         const Block = OpenTree.BlockType;
 
-        // Copy paste executeInterior/Boundary but adapted for OpenTree
-        // For brevity, let's reuse PoissonKernel logic but cast or redefine?
-        // Redefining is safer.
-        pub fn executeInterior(
-            self: *const @This(),
-            idx: usize,
-            blk: *const Block,
-            in: *const OpenArena,
-            out: *OpenArena,
-            g: ?*OpenGhost,
-            fr: ?*OpenTree.FluxRegister,
-        ) void {
-            _ = self;
-            _ = idx;
-            _ = blk;
-            _ = in;
-            _ = out;
-            _ = g;
-            _ = fr;
-        }
-
-        pub fn executeBoundary(
+        pub fn execute(
             self: *const @This(),
             block_idx: usize,
             block: *const Block,
-            psi_in: *const OpenArena,
-            psi_out: *OpenArena,
-            ghosts: ?*OpenGhost,
-            flux_reg: ?*OpenTree.FluxRegister,
+            ctx: *OpenApplyContext,
         ) void {
-            _ = psi_out;
-            _ = ghosts;
+            const psi_in = ctx.field_in orelse return;
             const slot = self.tree.getFieldSlot(block_idx);
             const in = psi_in.getSlotConst(slot);
             const h = block.spacing;
@@ -439,16 +396,16 @@ test "FluxRegister - Accumulation at C-F interface" {
                 }
 
                 if (is_fc) {
-                    if (flux_reg) |fr| computeAndAddFlux(self.tree, fr, block_idx, in, face, h, true);
+                    if (ctx.flux_reg) |fr| computeAndAddFlux(self.tree, fr, block_idx, in, face, h, true);
                 }
                 if (is_cf) {
-                    if (flux_reg) |fr| computeAndAddFlux(self.tree, fr, block_idx, in, face, h, false);
+                    if (ctx.flux_reg) |fr| computeAndAddFlux(self.tree, fr, block_idx, in, face, h, false);
                 }
             }
         }
 
         fn computeAndAddFlux(
-            tree: *const OpenTree,
+            tree_ptr: *const OpenTree,
             fr: *OpenTree.FluxRegister,
             block_idx: usize,
             in: []const [1]Complex,
@@ -473,9 +430,9 @@ test "FluxRegister - Accumulation at C-F interface" {
             }
 
             if (is_fine) {
-                fr.addFine(tree, block_idx, face, flux_face, 1.0) catch {};
+                fr.addFine(tree_ptr, block_idx, face, flux_face, 1.0) catch {};
             } else {
-                fr.addCoarse(tree, block_idx, face, flux_face, 1.0) catch {};
+                fr.addCoarse(tree_ptr, block_idx, face, flux_face, 1.0) catch {};
             }
         }
     };
@@ -507,8 +464,12 @@ test "FluxRegister - Accumulation at C-F interface" {
     defer flux_reg.deinit();
 
     const kernel = OpenKernel{ .tree = &tree };
-
-    try tree.apply(&kernel, &arena, &arena, &ghosts, &flux_reg);
+    var ctx = OpenApplyContext.init(&tree);
+    ctx.field_in = &arena;
+    ctx.field_out = &arena;
+    ctx.field_ghosts = &ghosts;
+    ctx.flux_reg = &flux_reg;
+    try tree.apply(&kernel, &ctx);
 
     var reduce_arena = std.heap.ArenaAllocator.init(allocator);
     defer reduce_arena.deinit();
@@ -639,14 +600,14 @@ test "FluxRegister - reduce merges per-thread registers" {
     };
 
     const Worker = struct {
-        fn run(ctx: WorkerCtx) void {
+        fn run(wctx: WorkerCtx) void {
             var flux_face: [face_cells][1]Complex = undefined;
             for (&flux_face) |*cell| {
-                cell.*[0] = Complex.init(ctx.value, 0.0);
+                cell.*[0] = Complex.init(wctx.value, 0.0);
             }
 
-            for (0..ctx.iterations) |_| {
-                ctx.fr.addCoarse(ctx.tree, ctx.block_idx, ctx.face, flux_face, 1.0) catch unreachable;
+            for (0..wctx.iterations) |_| {
+                wctx.fr.addCoarse(wctx.tree, wctx.block_idx, wctx.face, flux_face, 1.0) catch unreachable;
             }
         }
     };
@@ -655,7 +616,7 @@ test "FluxRegister - reduce merges per-thread registers" {
     var threads: [2]std.Thread = undefined;
 
     for (&threads, 0..) |*thread, i| {
-        const ctx = WorkerCtx{
+        const wctx = WorkerCtx{
             .fr = &flux_reg,
             .tree = &tree,
             .block_idx = block_idx,
@@ -663,7 +624,7 @@ test "FluxRegister - reduce merges per-thread registers" {
             .iterations = iterations,
             .value = values[i],
         };
-        thread.* = try std.Thread.spawn(.{}, Worker.run, .{ctx});
+        thread.* = try std.Thread.spawn(.{}, Worker.run, .{wctx});
     }
 
     for (threads) |thread| thread.join();

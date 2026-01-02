@@ -19,7 +19,6 @@
 //! var forces = try Force.AlgebraBuffer.init(allocator, 64);
 //! defer forces.deinit();
 //!
-//! try tree.fillGhosts();
 //! Force.computeTreeForces(&tree, &forces, beta);
 //! ```
 //!
@@ -341,14 +340,11 @@ pub fn AMRForce(comptime Frontend: type) type {
             // Ensure force buffer has enough blocks
             try forces.ensureBlocks(tree.tree.blocks.items.len);
 
-            // Fill link ghosts before force computation
-            try tree.fillGhosts();
-
             var kernel = ForceKernel{ .tree = tree, .forces = forces, .beta = beta };
 
             // Build ApplyContext (no field data, just tree reference)
             var ctx = amr.ApplyContext(Frontend).init(&tree.tree);
-            try tree.tree.apply(&kernel, &ctx);
+            try tree.apply(&kernel, &ctx);
 
             // Accumulate transmitted forces at refinement boundaries
             accumulateTransmittedForces(tree, forces, beta);

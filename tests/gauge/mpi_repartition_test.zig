@@ -63,7 +63,7 @@ test "mpi gauge repartition migrates links" {
     );
     defer shard.deinit();
 
-    tree.attachShard(&shard);
+    tree.tree.attachShard(&shard);
 
     try gauge.repartition.repartitionEntropyWeighted(GaugeTree, &tree, &arena, &shard, .{});
 

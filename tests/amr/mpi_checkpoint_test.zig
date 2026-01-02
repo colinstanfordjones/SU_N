@@ -28,6 +28,7 @@ test "mpi checkpoint restart ghost parity" {
     const Tree = amr.AMRTree(Frontend);
     const Arena = amr.FieldArena(Frontend);
     const Ghosts = amr.GhostBuffer(Frontend);
+    const ApplyContext = amr.ApplyContext(Frontend);
     const Checkpoint = checkpoint.TreeCheckpoint(Tree);
 
     var tree = try Tree.init(std.testing.allocator, 1.0, 4, 8);
@@ -55,45 +56,20 @@ test "mpi checkpoint restart ghost parity" {
     try ghosts_before.ensureForTree(&tree);
 
     const NoopKernel = struct {
-    pub fn executeInterior(
-        self: *const @This(),
-        blk_idx: usize,
-        block: *const Tree.BlockType,
-        psi_in: *Arena,
-        psi_out: *Arena,
-        ghosts: ?*Ghosts,
-        flux_reg: ?*Tree.FluxRegister,
-    ) void {
-        _ = self;
-        _ = blk_idx;
-        _ = block;
-        _ = psi_in;
-        _ = psi_out;
-        _ = ghosts;
-        _ = flux_reg;
-    }
-
-    pub fn executeBoundary(
-        self: *const @This(),
-        blk_idx: usize,
-        block: *const Tree.BlockType,
-        psi_in: *Arena,
-        psi_out: *Arena,
-        ghosts: ?*Ghosts,
-        flux_reg: ?*Tree.FluxRegister,
-    ) void {
-        _ = self;
-        _ = blk_idx;
-        _ = block;
-        _ = psi_in;
-        _ = psi_out;
-        _ = ghosts;
-        _ = flux_reg;
-    }
+        pub fn execute(
+            _: *const @This(),
+            _: usize,
+            _: *const Tree.BlockType,
+            _: *ApplyContext,
+        ) void {}
     };
 
     var kernel = NoopKernel{};
-    try tree.apply(&kernel, &arena, &arena, &ghosts_before, null);
+    var ctx = ApplyContext.init(&tree);
+    ctx.field_in = &arena;
+    ctx.field_out = &arena;
+    ctx.field_ghosts = &ghosts_before;
+    try tree.apply(&kernel, &ctx);
 
     const ghost_faces_before = ghosts_before.get(block_idx) orelse return error.TestExpectedEqual;
     var before_copy: Ghosts.GhostFaces = ghost_faces_before.*;
@@ -116,7 +92,11 @@ test "mpi checkpoint restart ghost parity" {
     defer ghosts_after.deinit();
     try ghosts_after.ensureForTree(&restored.tree);
 
-    try restored.tree.apply(&kernel, &restored.arena, &restored.arena, &ghosts_after, null);
+    var restored_ctx = ApplyContext.init(&restored.tree);
+    restored_ctx.field_in = &restored.arena;
+    restored_ctx.field_out = &restored.arena;
+    restored_ctx.field_ghosts = &ghosts_after;
+    try restored.tree.apply(&kernel, &restored_ctx);
 
     const ghost_faces_after = ghosts_after.get(block_idx) orelse return error.TestExpectedEqual;
     try std.testing.expect(std.mem.eql(u8, std.mem.asBytes(&before_copy), std.mem.asBytes(&ghost_faces_after.*)));

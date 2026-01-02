@@ -7,6 +7,7 @@ test {
     _ = @import("gauge/su2_tests.zig");
     _ = @import("gauge/u1_tests.zig");
     _ = @import("gauge/su3_tests.zig");
+    _ = @import("gauge/field_test.zig");
     _ = @import("gauge/checkpoint_test.zig");
     _ = @import("gauge/ghost_exchange_test.zig");
     _ = @import("gauge/mpi_link_exchange_test.zig");

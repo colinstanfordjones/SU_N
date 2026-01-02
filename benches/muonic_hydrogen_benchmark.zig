@@ -35,7 +35,7 @@ const MuonConstants = struct {
 fn runMuonicHydrogen(allocator: std.mem.Allocator, max_steps: usize) !void {
     const print = std.debug.print;
 
-    var tree = try GT.init(allocator, spacing, 2);
+    var tree = try GT.init(allocator, spacing, 2, 8);
     defer tree.deinit();
 
     var psi = try Arena.init(allocator, 32);

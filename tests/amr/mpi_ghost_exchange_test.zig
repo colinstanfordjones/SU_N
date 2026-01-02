@@ -24,6 +24,7 @@ test "mpi ghost exchange handles open boundaries" {
     const Block = Tree.BlockType;
     const FieldArena = amr.FieldArena(Frontend);
     const Ghosts = amr.GhostBuffer(Frontend);
+    const ApplyContext = amr.ApplyContext(Frontend);
 
     var tree = try Tree.init(std.testing.allocator, 1.0, 4, 8);
     defer tree.deinit();
@@ -49,52 +50,21 @@ test "mpi ghost exchange handles open boundaries" {
 
     const Kernel = struct {
         pub fn execute(
-            self: *@This(),
-            blk_idx: usize,
-            block: *const Block,
-            psi_in: *FieldArena,
-            psi_out: *FieldArena,
-            ghosts_ptr: ?*Ghosts,
-        ) void {
-            _ = self;
-            _ = blk_idx;
-            _ = block;
-            _ = psi_in;
-            _ = psi_out;
-            _ = ghosts_ptr;
-        }
-
-        pub fn executeInterior(
-            self: *@This(),
-            blk_idx: usize,
-            block: *const Block,
-            psi_in: *FieldArena,
-            psi_out: *FieldArena,
-            ghosts_ptr: ?*Ghosts,
-            flux_reg: ?*Tree.FluxRegister,
-        ) void {
-            _ = flux_reg;
-            self.execute(blk_idx, block, psi_in, psi_out, ghosts_ptr);
-        }
-
-        pub fn executeBoundary(
-            self: *@This(),
-            blk_idx: usize,
-            block: *const Block,
-            psi_in: *FieldArena,
-            psi_out: *FieldArena,
-            ghosts_ptr: ?*Ghosts,
-            flux_reg: ?*Tree.FluxRegister,
-        ) void {
-            _ = flux_reg;
-            self.execute(blk_idx, block, psi_in, psi_out, ghosts_ptr);
-        }
+            _: *const @This(),
+            _: usize,
+            _: *const Block,
+            _: *ApplyContext,
+        ) void {}
     };
 
     tree.attachShard(&shard);
 
     var kernel = Kernel{};
-    try tree.apply(&kernel, &arena, &arena, &ghosts, null);
+    var ctx = ApplyContext.init(&tree);
+    ctx.field_in = &arena;
+    ctx.field_out = &arena;
+    ctx.field_ghosts = &ghosts;
+    try tree.apply(&kernel, &ctx);
 
     const ghost_faces = ghosts.get(block_idx) orelse return error.TestExpectedEqual;
 

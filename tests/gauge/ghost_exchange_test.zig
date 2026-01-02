@@ -65,8 +65,9 @@ test "gauge ghost fine-to-coarse does not accumulate" {
         _ = try tree.insertBlock(origin, coarse_block.level + 1);
     }
 
-    for (tree.links.items, 0..) |links, idx| {
+    for (0..tree.blockCount()) |idx| {
         if (idx == coarse_idx) continue;
+        const links = tree.getBlockLinksMut(idx).?;
         var link = Link.identity();
         link.matrix.data[0][0] = Complex.init(@as(f64, @floatFromInt(idx + 1)), 0);
         for (links) |*l| l.* = link;
@@ -74,7 +75,7 @@ test "gauge ghost fine-to-coarse does not accumulate" {
 
     try tree.fillGhosts();
 
-    const ghost = &tree.ghosts.items[coarse_idx];
+    const ghost = tree.field.ghosts.get(coarse_idx).?;
     const face_idx: usize = 0; // +x face
     const link_dim: usize = 1; // tangential direction
     const ghost_slice = ghost.get(face_idx, link_dim);
@@ -103,7 +104,7 @@ test "gauge ghost exchange uses custom spec for local fills" {
     const Topology = amr.topology.OpenTopology(2, .{ 16.0, 16.0 });
     const Frontend = gauge.GaugeFrontend(1, 1, 2, 4, Topology);
     const GaugeTree = gauge.GaugeTree(Frontend);
-    const Policy = ghost_policy.LinkGhostPolicy(GaugeTree);
+    const Policy = ghost_policy.LinkGhostPolicy(GaugeTree.GaugeFieldType);
     const Context = Policy.Context;
     const Payload = Policy.Payload;
     const Link = Frontend.LinkType;

@@ -97,7 +97,7 @@ test "checkpoint restart rebuilds ghost buffers deterministically" {
     var ghosts_before = try Ghosts.init(std.testing.allocator, 4);
     defer ghosts_before.deinit();
     try ghosts_before.ensureForTree(&tree);
-    amr.ghost.fillGhostLayers(Tree, &tree, &arena, ghosts_before.slice(tree.blocks.items.len));
+    try tree.fillGhostLayers(&arena, ghosts_before.slice(tree.blocks.items.len));
 
     var buffer = std.ArrayList(u8){};
     defer buffer.deinit(std.testing.allocator);
@@ -111,7 +111,7 @@ test "checkpoint restart rebuilds ghost buffers deterministically" {
     var ghosts_after = try Ghosts.init(std.testing.allocator, 4);
     defer ghosts_after.deinit();
     try ghosts_after.ensureForTree(&restored.tree);
-    amr.ghost.fillGhostLayers(Tree, &restored.tree, &restored.arena, ghosts_after.slice(restored.tree.blocks.items.len));
+    try restored.tree.fillGhostLayers(&restored.arena, ghosts_after.slice(restored.tree.blocks.items.len));
 
     const invalid = std.math.maxInt(usize);
     const count = @min(tree.blocks.items.len, restored.tree.blocks.items.len);

@@ -53,6 +53,7 @@ pub const spacetime = @import("spacetime.zig");
 pub const frontend = @import("frontend.zig");
 pub const operators = @import("operators.zig");
 pub const tree = @import("tree.zig");
+pub const field = @import("field.zig");
 pub const ghost_policy = @import("ghost_policy.zig");
 pub const repartition = @import("repartition.zig");
 
@@ -63,11 +64,14 @@ pub const LinkOperators = operators.LinkOperators;
 
 // Re-export GaugeTree for high-level AMR usage
 pub const GaugeTree = tree.GaugeTree;
+// Re-export GaugeField for stateless AMR usage
+pub const GaugeField = field.GaugeField;
 
 test {
     _ = frontend;
     _ = operators;
     _ = tree;
+    _ = field;
     _ = ghost_policy;
     _ = repartition;
 }

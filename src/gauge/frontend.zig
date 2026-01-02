@@ -117,6 +117,9 @@ pub fn GaugeFrontend(
         /// Link variable type for this gauge group
         pub const LinkType = LinkType_;
 
+        /// Edge-centered data type (alias for gauge links).
+        pub const EdgeType = LinkType_;
+
         // =====================================================================
         // Derived Constants
         // =====================================================================
@@ -140,6 +143,9 @@ pub fn GaugeFrontend(
 
         /// Total links per block = volume * Nd (one link per direction per site)
         pub const links_per_block: usize = volume * Nd_;
+
+        /// Total edges per block (alias for gauge links).
+        pub const edges_per_block: usize = links_per_block;
 
         // =====================================================================
         // Link Operators (Gauge-Specific Prolongation/Restriction)

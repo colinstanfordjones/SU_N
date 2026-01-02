@@ -4,56 +4,49 @@ const su_n = @import("su_n");
 const amr = @import("amr");
 const constants = su_n.constants;
 
+const StressTopology = amr.topology.OpenTopology(2, .{ 32.0, 32.0 });
+const Frontend = amr.ScalarFrontend(2, 8, StressTopology);
+const Tree = amr.AMRTree(Frontend);
+const Block = amr.AMRBlock(Frontend);
+const Arena = amr.FieldArena(Frontend);
+const GhostBuffer = amr.GhostBuffer(Frontend);
+const ApplyContext = amr.ApplyContext(Frontend);
+
+const TimingTopology = amr.topology.OpenTopology(2, .{ 4.0, 4.0 });
+const TimingFrontend = amr.ScalarFrontend(2, 4, TimingTopology);
+const TimingTree = amr.AMRTree(TimingFrontend);
+const TimingBlock = amr.AMRBlock(TimingFrontend);
+const TimingGhostBuffer = amr.GhostBuffer(TimingFrontend);
+const TimingApplyContext = amr.ApplyContext(TimingFrontend);
+
+/// Diffusion kernel for stress testing.
+/// Implements the heat equation: du/dt = alpha * laplacian(u)
 const StressKernel = struct {
     tree: *const Tree,
     alpha: f64,
     dt: f64,
 
-    pub fn executeInterior(
-        self: *StressKernel,
+    /// Execute kernel on a single block using ApplyContext.
+    pub fn execute(
+        self: *const StressKernel,
         block_idx: usize,
         block: *const Block,
-        inputs: *Arena,
-        outputs: *Arena,
-        ghosts: ?*GhostBuffer,
-        flux_reg: ?*Tree.FluxRegister,
-    ) void {
-        _ = flux_reg;
-        self.executeRegion(.interior, block_idx, block, inputs, outputs, ghosts);
-    }
-
-    pub fn executeBoundary(
-        self: *StressKernel,
-        block_idx: usize,
-        block: *const Block,
-        inputs: *Arena,
-        outputs: *Arena,
-        ghosts: ?*GhostBuffer,
-        flux_reg: ?*Tree.FluxRegister,
-    ) void {
-        _ = flux_reg;
-        self.executeRegion(.boundary, block_idx, block, inputs, outputs, ghosts);
-    }
-
-    const SiteRegion = enum {
-        interior,
-        boundary,
-    };
-
-    fn executeRegion(
-        self: *StressKernel,
-        region: SiteRegion,
-        block_idx: usize,
-        block: *const Block,
-        inputs: *Arena,
-        outputs: *Arena,
-        ghosts: ?*GhostBuffer,
+        ctx: *ApplyContext,
     ) void {
         const slot = self.tree.getFieldSlot(block_idx);
+        if (slot == std.math.maxInt(usize)) return;
+
+        const inputs = ctx.field_in orelse return;
+        const outputs = ctx.field_out orelse return;
+
         const u = inputs.getSlotConst(slot);
         const u_new = outputs.getSlot(slot);
 
-        const ghost_faces = if (ghosts) |g| g.get(block_idx) orelse return else return;
+        // Get ghost faces
+        var ghost_faces: ?*GhostBuffer.GhostFaces = null;
+        if (ctx.field_ghosts) |ghosts| {
+            ghost_faces = ghosts.get(block_idx);
+        }
 
         const spacing = block.spacing;
         const inv_dx2 = 1.0 / (spacing * spacing);
@@ -61,12 +54,6 @@ const StressKernel = struct {
 
         for (0..Block.volume) |i| {
             const coords = Block.getLocalCoords(i);
-            const on_boundary = Block.isOnBoundary(coords);
-            switch (region) {
-                .interior => if (on_boundary) continue,
-                .boundary => if (!on_boundary) continue,
-            }
-
             const val = u[i];
             var laplacian: f64 = 0.0;
 
@@ -75,16 +62,20 @@ const StressKernel = struct {
 
             // +X
             if (coords[0] == Frontend.block_size - 1) {
-                const ghost_idx = Block.getGhostIndex(coords, 0);
-                if (ghost_idx < ghost_faces[0].len) val_plus = ghost_faces[0][ghost_idx];
+                if (ghost_faces) |gf| {
+                    const ghost_idx = Block.getGhostIndex(coords, 0);
+                    if (ghost_idx < gf[0].len) val_plus = gf[0][ghost_idx];
+                }
             } else {
                 val_plus = u[Block.localNeighborFast(i, 0)];
             }
 
             // -X
             if (coords[0] == 0) {
-                const ghost_idx = Block.getGhostIndex(coords, 1);
-                if (ghost_idx < ghost_faces[1].len) val_minus = ghost_faces[1][ghost_idx];
+                if (ghost_faces) |gf| {
+                    const ghost_idx = Block.getGhostIndex(coords, 1);
+                    if (ghost_idx < gf[1].len) val_minus = gf[1][ghost_idx];
+                }
             } else {
                 val_minus = u[Block.localNeighborFast(i, 1)];
             }
@@ -92,16 +83,20 @@ const StressKernel = struct {
 
             // +Y
             if (coords[1] == Frontend.block_size - 1) {
-                const ghost_idx = Block.getGhostIndex(coords, 2);
-                if (ghost_idx < ghost_faces[2].len) val_plus = ghost_faces[2][ghost_idx];
+                if (ghost_faces) |gf| {
+                    const ghost_idx = Block.getGhostIndex(coords, 2);
+                    if (ghost_idx < gf[2].len) val_plus = gf[2][ghost_idx];
+                }
             } else {
                 val_plus = u[Block.localNeighborFast(i, 2)];
             }
 
             // -Y
             if (coords[1] == 0) {
-                const ghost_idx = Block.getGhostIndex(coords, 3);
-                if (ghost_idx < ghost_faces[3].len) val_minus = ghost_faces[3][ghost_idx];
+                if (ghost_faces) |gf| {
+                    const ghost_idx = Block.getGhostIndex(coords, 3);
+                    if (ghost_idx < gf[3].len) val_minus = gf[3][ghost_idx];
+                }
             } else {
                 val_minus = u[Block.localNeighborFast(i, 3)];
             }
@@ -112,83 +107,23 @@ const StressKernel = struct {
     }
 };
 
+/// Timing kernel for measuring execution patterns.
 const TimingKernel = struct {
-    pull_sleep_ns: u64,
-    interior_sleep_ns: u64,
-    interior_count: *std.atomic.Value(usize),
-    boundary_count: *std.atomic.Value(usize),
+    exec_sleep_ns: u64,
+    exec_count: *std.atomic.Value(usize),
 
-    pub fn ghostPrepare(self: *TimingKernel) !bool {
-        _ = self;
-        return true;
-    }
-
-    pub fn ghostPull(self: *TimingKernel, block_idx: usize) void {
-        _ = block_idx;
-        std.Thread.sleep(self.pull_sleep_ns);
-    }
-
-    pub fn ghostPush(self: *TimingKernel, block_idx: usize) void {
-        _ = self;
-        _ = block_idx;
-    }
-
-    pub fn ghostFinalize(self: *TimingKernel) void {
-        _ = self;
-    }
-
-    pub fn executeInterior(
-        self: *const @This(),
-        blk_idx: usize,
-        block: anytype,
-        psi_in: anytype,
-        psi_out: anytype,
-        ghosts: anytype,
-        flux_reg: anytype,
+    pub fn execute(
+        self: *const TimingKernel,
+        _: usize,
+        _: *const TimingBlock,
+        _: *TimingApplyContext,
     ) void {
-        _ = blk_idx;
-        _ = block;
-        _ = psi_in;
-        _ = psi_out;
-        _ = ghosts;
-        _ = flux_reg;
-        _ = self.interior_count.fetchAdd(1, .acq_rel);
-        std.Thread.sleep(self.interior_sleep_ns);
-    }
-
-    pub fn executeBoundary(
-        self: *const @This(),
-        blk_idx: usize,
-        block: anytype,
-        psi_in: anytype,
-        psi_out: anytype,
-        ghosts: anytype,
-        flux_reg: anytype,
-    ) void {
-        _ = blk_idx;
-        _ = block;
-        _ = psi_in;
-        _ = psi_out;
-        _ = ghosts;
-        _ = flux_reg;
-        _ = self.boundary_count.fetchAdd(1, .acq_rel);
+        _ = self.exec_count.fetchAdd(1, .acq_rel);
+        std.Thread.sleep(self.exec_sleep_ns);
     }
 };
 
-const StressTopology = amr.topology.OpenTopology(2, .{ 32.0, 32.0 });
-const Frontend = amr.ScalarFrontend(2, 8, StressTopology);
-const Tree = amr.AMRTree(Frontend);
-const Block = amr.AMRBlock(Frontend);
-const Arena = amr.FieldArena(Frontend);
-const GhostBuffer = amr.GhostBuffer(Frontend);
-
-const TimingTopology = amr.topology.OpenTopology(2, .{ 4.0, 4.0 });
-const TimingFrontend = amr.ScalarFrontend(2, 4, TimingTopology);
-const TimingTree = amr.AMRTree(TimingFrontend);
-const TimingBlock = amr.AMRBlock(TimingFrontend);
-const TimingGhostBuffer = amr.GhostBuffer(TimingFrontend);
-
-test "AMR pipeline stress matches sequential" {
+test "AMR pipeline stress matches reference" {
     var tree = try Tree.init(std.testing.allocator, 1.0, 2, 8);
     defer tree.deinit();
 
@@ -232,30 +167,42 @@ test "AMR pipeline stress matches sequential" {
     try ghosts_ref.ensureForTree(&tree);
 
     var kernel = StressKernel{ .tree = &tree, .alpha = 0.25, .dt = 0.1 };
+    var ref_kernel = StressKernel{ .tree = &tree, .alpha = 0.25, .dt = 0.1 };
 
     var iter: usize = 0;
     while (iter < 3) : (iter += 1) {
-        try tree.apply(&kernel, &arena_in, &arena_out, &ghosts_pipeline, null);
+        // Pipeline execution
+        var ctx = ApplyContext.init(&tree);
+        ctx.field_in = &arena_in;
+        ctx.field_out = &arena_out;
+        ctx.field_ghosts = &ghosts_pipeline;
+        try tree.apply(&kernel, &ctx);
 
+        // Reference execution (manual ghost fill + sequential)
         const ghost_len = tree.blocks.items.len;
-        amr.ghost.fillGhostLayers(Tree, &tree, &arena_in, ghosts_ref.slice(ghost_len));
+        try tree.fillGhostLayers(&arena_in, ghosts_ref.slice(ghost_len));
+
+        var ref_ctx = ApplyContext.init(&tree);
+        ref_ctx.field_in = &arena_in;
+        ref_ctx.field_out = &arena_ref;
+        ref_ctx.field_ghosts = &ghosts_ref;
 
         for (tree.blocks.items, 0..) |*block, idx| {
             if (block.block_index == std.math.maxInt(usize)) continue;
             const slot = tree.getFieldSlot(idx);
             if (slot == std.math.maxInt(usize)) continue;
 
-            kernel.executeInterior(idx, block, &arena_in, &arena_ref, &ghosts_ref, null);
-            kernel.executeBoundary(idx, block, &arena_in, &arena_ref, &ghosts_ref, null);
+            ref_kernel.execute(idx, block, &ref_ctx);
         }
 
+        // Compare results
         for (tree.blocks.items, 0..) |*block, idx| {
             if (block.block_index == std.math.maxInt(usize)) continue;
             const slot = tree.getFieldSlot(idx);
             if (slot == std.math.maxInt(usize)) continue;
 
-            const out = arena_out.getSlot(slot);
-            const ref = arena_ref.getSlot(slot);
+            const out = arena_out.getSlotConst(slot);
+            const ref = arena_ref.getSlotConst(slot);
             for (out, 0..) |val, i| {
                 try std.testing.expectApproxEqAbs(val, ref[i], constants.test_epsilon);
             }
@@ -265,34 +212,22 @@ test "AMR pipeline stress matches sequential" {
     }
 }
 
-test "AMR pipeline overlaps interior and ghost pull" {
+test "AMR kernel execution count" {
     var tree = try TimingTree.init(std.testing.allocator, 1.0, 1, 8);
     defer tree.deinit();
     _ = try tree.insertBlock(.{ 0, 0 }, 0);
 
-    var interior_count = std.atomic.Value(usize).init(0);
-    var boundary_count = std.atomic.Value(usize).init(0);
+    var exec_count = std.atomic.Value(usize).init(0);
 
-    const sleep_ns = 50 * std.time.ns_per_ms;
+    const sleep_ns = 10 * std.time.ns_per_ms;
     var kernel = TimingKernel{
-        .pull_sleep_ns = sleep_ns,
-        .interior_sleep_ns = sleep_ns,
-        .interior_count = &interior_count,
-        .boundary_count = &boundary_count,
+        .exec_sleep_ns = sleep_ns,
+        .exec_count = &exec_count,
     };
 
-    var timer = try std.time.Timer.start();
-    try tree.apply(&kernel, @as(void, {}), @as(void, {}), null, null);
-    const elapsed = timer.read();
+    var ctx = TimingApplyContext.init(&tree);
+    try tree.apply(&kernel, &ctx);
 
-    try std.testing.expectEqual(@as(usize, 1), interior_count.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 1), boundary_count.load(.acquire));
-
-    if (!builtin.single_threaded) {
-        const cpu_count = std.Thread.getCpuCount() catch 1;
-        if (cpu_count > 1) {
-            const threshold = sleep_ns + (sleep_ns * 8 / 10);
-            try std.testing.expect(elapsed < threshold);
-        }
-    }
+    // Single block should be executed once
+    try std.testing.expectEqual(@as(usize, 1), exec_count.load(.acquire));
 }

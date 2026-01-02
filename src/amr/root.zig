@@ -12,6 +12,10 @@ pub const topology = @import("topology.zig");
 // Core infrastructure (domain-agnostic)
 pub const morton = @import("morton.zig");
 pub const field_arena = @import("field_arena.zig");
+pub const field_math = @import("field_math.zig");
+pub const edge_arena = @import("edge_arena.zig");
+pub const edge_ghost_buffer = @import("edge_ghost_buffer.zig");
+pub const apply_context = @import("apply_context.zig");
 
 // Tree and block structure
 pub const tree = @import("tree.zig");
@@ -35,11 +39,17 @@ pub const FieldArena = field_arena.FieldArena;
 pub const AMRTree = tree.AMRTree;
 pub const AMRBlock = block.AMRBlock;
 pub const GhostBuffer = ghost_buffer.GhostBuffer;
+pub const EdgeArena = edge_arena.EdgeArena;
+pub const EdgeGhostBuffer = edge_ghost_buffer.EdgeGhostBuffer;
+pub const LinkArena = EdgeArena; // Compatibility alias.
+pub const LinkGhostBuffer = EdgeGhostBuffer; // Compatibility alias.
+pub const ApplyContext = apply_context.ApplyContext;
 pub const FrontendInfo = frontend.FrontendInfo;
 pub const validateFrontend = frontend.validateFrontend;
 pub const ScalarFrontend = frontend.ScalarFrontend;
 pub const ComplexScalarFrontend = frontend.ComplexScalarFrontend;
 pub const AMROperators = operators.AMROperators;
+pub const FluxRegister = flux_register.FluxRegister;
 pub const ShardStrategy = shard.ShardStrategy;
 pub const ShardContext = shard.ShardContext;
 pub const BlockKey = shard.BlockKey;
@@ -57,6 +67,10 @@ test {
     _ = topology;
     _ = morton;
     _ = field_arena;
+    _ = field_math;
+    _ = edge_arena;
+    _ = edge_ghost_buffer;
+    _ = apply_context;
     _ = tree;
     _ = block;
     _ = operators;

@@ -31,7 +31,7 @@
 //! Energy in m_e, length in 1/m_e.
 
 const std = @import("std");
-const amr = @import("amr");
+const amr_mod = @import("amr");
 const gauge = @import("gauge");
 const constants = @import("constants");
 
@@ -67,8 +67,9 @@ pub fn HamiltonianDiracAMR(comptime N_gauge: usize, comptime block_size: usize, 
 
     const GaugeTree = gauge.GaugeTree(Frontend);
     const Block = GaugeTree.BlockType;
-    const Arena = amr.FieldArena(Frontend);
-    const GhostBuffer = amr.GhostBuffer(Frontend);
+    const Arena = amr_mod.FieldArena(Frontend);
+    const GhostBuffer = amr_mod.GhostBuffer(Frontend);
+    const ApplyContext = amr_mod.ApplyContext(Frontend);
     const Link = Frontend.LinkType;
 
     return struct {
@@ -162,50 +163,45 @@ pub fn HamiltonianDiracAMR(comptime N_gauge: usize, comptime block_size: usize, 
             self.soft_core = soft_core;
         }
 
-        pub fn ghostPrepare(self: *Self) !bool {
-            return try self.gauge_tree.prepareLinkGhostExchange();
-        }
-
-        pub fn ghostPull(self: *Self, block_idx: usize) void {
-            self.gauge_tree.fillGhostsPull(block_idx);
-        }
-
-        pub fn ghostPush(self: *Self, block_idx: usize) void {
-            self.gauge_tree.fillGhostsPush(block_idx);
-        }
-
-        pub fn ghostFinalize(self: *Self) void {
-            self.gauge_tree.finalizeLinkGhostExchange();
-        }
-
-        pub fn executeInterior(
+        /// Execute the Dirac Hamiltonian on a single block.
+        /// This is the kernel interface for AMRTree.apply().
+        /// H = alpha . (-iD) + beta*m + V
+        pub fn execute(
             self: *const Self,
             block_idx: usize,
             block: *const Block,
-            psi_in: *const FieldArena,
-            psi_out: *FieldArena,
-            ghosts: ?*GhostBuffer,
-            flux_reg: ?*GaugeTree.TreeType.FluxRegister,
+            ctx: *ApplyContext,
         ) void {
-            _ = flux_reg;
-            @constCast(self).executeRegion(.interior, block_idx, block, psi_in, psi_out, ghosts);
-        }
+            const tree = ctx.tree;
+            const slot = tree.getFieldSlot(block_idx);
+            if (slot == std.math.maxInt(usize)) return;
 
-        pub fn executeBoundary(
-            self: *const Self,
-            block_idx: usize,
-            block: *const Block,
-            psi_in: *const FieldArena,
-            psi_out: *FieldArena,
-            ghosts: ?*GhostBuffer,
-            flux_reg: ?*GaugeTree.TreeType.FluxRegister,
-        ) void {
-            _ = flux_reg;
-            @constCast(self).executeRegion(.boundary, block_idx, block, psi_in, psi_out, ghosts);
+            const psi_in_arena = ctx.field_in orelse return;
+            const psi_out_arena = ctx.field_out orelse return;
+
+            const psi = psi_in_arena.getSlotConst(slot);
+            const out = psi_out_arena.getSlot(slot);
+
+            // Get ghost slices
+            var psi_ghost_slices: [num_faces][]const [N_field]Complex = undefined;
+            for (0..num_faces) |f| {
+                psi_ghost_slices[f] = &.{};
+            }
+
+            if (ctx.field_ghosts) |ghosts| {
+                if (ghosts.get(block_idx)) |gp| {
+                    for (0..num_faces) |f| {
+                        psi_ghost_slices[f] = &gp[f];
+                    }
+                }
+            }
+
+            // Apply Hamiltonian to all sites
+            self.applyToBlock(block_idx, block, psi, out, psi_ghost_slices);
         }
 
         /// Apply Dirac Hamiltonian: H psi = [alpha . (-iD) + beta*m + V] psi.
-        /// Wrapper around AMRTree.apply.
+        /// Convenience wrapper that creates ApplyContext and calls tree.apply().
         pub fn apply(
             self: *Self,
             psi_in: *const FieldArena,
@@ -213,62 +209,30 @@ pub fn HamiltonianDiracAMR(comptime N_gauge: usize, comptime block_size: usize, 
             ghosts: *GhostBuffer,
             flux_reg: ?*GaugeTree.TreeType.FluxRegister,
         ) !void {
-            try self.gauge_tree.tree.apply(self, psi_in, psi_out, ghosts, flux_reg);
+            // Build ApplyContext
+            var ctx = ApplyContext.init(&self.gauge_tree.tree);
+            ctx.field_in = psi_in;
+            ctx.field_out = psi_out;
+            ctx.field_ghosts = ghosts;
+            ctx.flux_reg = flux_reg;
+
+            try self.gauge_tree.apply(self, &ctx);
         }
 
-        /// Apply Dirac Hamiltonian to a single block.
-        /// H = alpha . (-iD) + beta*m + V
+        /// Apply Dirac Hamiltonian to a single block (internal).
         fn applyToBlock(
-            self: *Self,
+            self: *const Self,
             block_idx: usize,
             block: *const Block,
             psi_in: []const [N_field]Complex,
             psi_out: [][N_field]Complex,
             psi_ghosts: [num_faces][]const [N_field]Complex,
         ) void {
-            self.applyToBlockRegion(.all, block_idx, block, psi_in, psi_out, psi_ghosts);
+            self.applyToBlockImpl(block_idx, block, psi_in, psi_out, psi_ghosts);
         }
 
-        const SiteRegion = enum {
-            all,
-            interior,
-            boundary,
-        };
-
-        fn executeRegion(
-            self: *Self,
-            region: SiteRegion,
-            block_idx: usize,
-            block: *const Block,
-            inputs: anytype,
-            outputs: anytype,
-            ghosts: ?*GhostBuffer,
-        ) void {
-            const psi_in_arena = inputs;
-            const psi_out_arena = outputs;
-
-            const slot = self.gauge_tree.tree.getFieldSlot(block_idx);
-            const psi = psi_in_arena.getSlotConst(slot);
-            const out = psi_out_arena.getSlot(slot);
-
-            var psi_ghost_slices: [num_faces][]const [N_field]Complex = undefined;
-            for (0..num_faces) |f| {
-                psi_ghost_slices[f] = &.{};
-            }
-            if (ghosts) |g| {
-                if (g.get(block_idx)) |gp| {
-                    for (0..num_faces) |f| {
-                        psi_ghost_slices[f] = &gp[f];
-                    }
-                }
-            }
-
-            self.applyToBlockRegion(region, block_idx, block, psi, out, psi_ghost_slices);
-        }
-
-        fn applyToBlockRegion(
-            self: *Self,
-            region: SiteRegion,
+        fn applyToBlockImpl(
+            self: *const Self,
             block_idx: usize,
             block: *const Block,
             psi_in: []const [N_field]Complex,
@@ -280,13 +244,6 @@ pub fn HamiltonianDiracAMR(comptime N_gauge: usize, comptime block_size: usize, 
 
             for (0..block_volume) |site| {
                 const coords = Block.getLocalCoords(site);
-                const on_boundary = Block.isOnBoundary(coords);
-                switch (region) {
-                    .all => {},
-                    .interior => if (on_boundary) continue,
-                    .boundary => if (!on_boundary) continue,
-                }
-
                 const pos = block.getPhysicalPosition(site);
 
                 // Get spinor components at current site
@@ -386,7 +343,7 @@ pub fn HamiltonianDiracAMR(comptime N_gauge: usize, comptime block_size: usize, 
         /// Compute gauge-covariant derivative in direction mu.
         /// D_mu psi = [U_mu(x) psi(x+mu) - U_dag_mu(x-mu) psi(x-mu)] / (2a)
         fn computeCovariantDerivative(
-            self: *Self,
+            self: *const Self,
             block_idx: usize,
             block: *const Block,
             psi_in: []const [N_field]Complex,
@@ -499,7 +456,7 @@ pub fn HamiltonianDiracAMR(comptime N_gauge: usize, comptime block_size: usize, 
             ghosts: *GhostBuffer,
         ) !f64 {
             // Apply H to psi
-            try self.apply(psi, workspace, ghosts);
+            try self.apply(psi, workspace, ghosts, null);
 
             // Compute <psi|H psi> with volume weighting
             var energy: f64 = 0.0;
@@ -589,7 +546,7 @@ pub fn HamiltonianDiracAMR(comptime N_gauge: usize, comptime block_size: usize, 
             delta_tau: f64,
         ) !void {
             // 1. Compute H psi -> workspace1
-            try self.apply(psi, workspace1, ghosts);
+            try self.apply(psi, workspace1, ghosts, null);
 
             // 2. Compute phi = (H-m) psi -> workspace1
             for (self.gauge_tree.tree.blocks.items, 0..) |*block, idx| {
@@ -611,7 +568,7 @@ pub fn HamiltonianDiracAMR(comptime N_gauge: usize, comptime block_size: usize, 
             }
 
             // 3. Compute H phi -> workspace2
-            try self.apply(workspace1, workspace2, ghosts);
+            try self.apply(workspace1, workspace2, ghosts, null);
 
             // 4. Compute (H-m) phi and update psi
             for (self.gauge_tree.tree.blocks.items, 0..) |*block, idx| {

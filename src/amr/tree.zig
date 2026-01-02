@@ -48,6 +48,7 @@ const ghost_buffer_mod = @import("ghost_buffer.zig");
 const dist_exchange_mod = @import("dist_exchange.zig");
 const ghost_policy_mod = @import("ghost_policy.zig");
 const flux_register_mod = @import("flux_register.zig");
+const apply_context_mod = @import("apply_context.zig");
 const morton_mod = @import("morton.zig");
 const platform = @import("platform");
 const shard_mod = @import("shard.zig");
@@ -89,6 +90,7 @@ pub fn AMRTree(comptime Frontend: type) type {
         pub const BlockKey = morton_mod.BlockKey;
         pub const max_fine_neighbors = @as(usize, 1) << @intCast(Nd - 1);
         pub const FluxRegister = flux_register_mod.FluxRegister(Self);
+        pub const ApplyContext = apply_context_mod.ApplyContext(Frontend);
 
         /// Information about a neighbor block, including cross-level relationships.
         pub const NeighborInfo = struct {
@@ -503,27 +505,24 @@ pub fn AMRTree(comptime Frontend: type) type {
         // Threaded Kernel Execution
         // =====================================================================
 
-        /// Apply a kernel to the mesh using threaded AMR scheduling.
+        /// Apply a kernel to the mesh using an ApplyContext.
+        ///
+        /// ApplyContext bundles all state references needed for kernel execution:
+        /// - tree: Reference to this AMR tree
+        /// - field_in/field_out: Input/output field arenas
+        /// - field_ghosts: Ghost buffer for field exchange
+        /// - edges/edge_ghosts: Edge-centered storage for staggered kernels
+        /// - flux_reg: Optional flux register for conservation
         ///
         /// The kernel must implement:
-        /// `fn executeInterior(self: *Self, block_idx: usize, block: *const Block, inputs: anytype, outputs: anytype, ghosts: ?*GhostBuffer) void`
-        /// `fn executeBoundary(self: *Self, block_idx: usize, block: *const Block, inputs: anytype, outputs: anytype, ghosts: ?*GhostBuffer) void`
+        /// `fn execute(block_idx: usize, block: *const Block, ctx: *ApplyContext) void`
         ///
-        /// Optional ghost exchange hooks for additional (non-field) ghosts:
-        /// `fn ghostPrepare(self: *Self) !bool` (return true if exchange needed)
-        /// `fn ghostPull(self: *Self, block_idx: usize) void`
-        /// `fn ghostPush(self: *Self, block_idx: usize) void`
-        /// `fn ghostFinalize(self: *Self) void`
+        /// Ghost exchange is handled automatically based on context configuration.
         pub fn apply(
             self: *Self,
             kernel: anytype,
-            inputs: anytype,
-            outputs: anytype,
-            ghosts: ?*ghost_buffer_mod.GhostBuffer(Frontend),
-            flux_reg: ?*FluxRegister,
+            ctx: *ApplyContext,
         ) !void {
-            const Inputs = @TypeOf(inputs);
-            const Outputs = @TypeOf(outputs);
             const KernelType = @TypeOf(kernel);
             const KernelDecl = switch (@typeInfo(KernelType)) {
                 .pointer => std.meta.Child(KernelType),
@@ -531,213 +530,88 @@ pub fn AMRTree(comptime Frontend: type) type {
             };
 
             comptime {
-                if (!@hasDecl(KernelDecl, "executeInterior") or !@hasDecl(KernelDecl, "executeBoundary")) {
-                    @compileError("Kernel must implement executeInterior and executeBoundary for AMR apply.");
-                }
-
-                const has_prepare = @hasDecl(KernelDecl, "ghostPrepare");
-                const has_pull = @hasDecl(KernelDecl, "ghostPull");
-                const has_push = @hasDecl(KernelDecl, "ghostPush");
-                const has_finalize = @hasDecl(KernelDecl, "ghostFinalize");
-                const has_any = has_prepare or has_pull or has_push or has_finalize;
-                const has_all = has_prepare and has_pull and has_push and has_finalize;
-                if (has_any and !has_all) {
-                    @compileError("Kernel ghost hooks must implement ghostPrepare/ghostPull/ghostPush/ghostFinalize as a set.");
+                if (!@hasDecl(KernelDecl, "execute")) {
+                    @compileError("Kernel must implement execute(block_idx, block, ctx) for applyWithContext.");
                 }
             }
 
-            const has_extra_ghosts = @hasDecl(KernelDecl, "ghostPrepare");
-
-            if (ghosts) |g| {
+            // Ensure ghost buffers are sized for this tree
+            if (ctx.field_ghosts) |g| {
                 try g.ensureForTree(self);
             }
 
-            var extra_needed = false;
-            if (comptime has_extra_ghosts) {
-                extra_needed = try kernel.ghostPrepare();
-            }
-
-            const needs_field_ghosts = ghosts != null and Inputs != void;
-
+            // Begin field ghost exchange if we have field data
+            const needs_field_ghosts = ctx.field_in != null and ctx.field_ghosts != null;
             var field_arena: ?*const ArenaType = null;
-            var field_ghosts: []?*ghost_buffer_mod.GhostBuffer(Frontend).GhostFaces = &[_]?*ghost_buffer_mod.GhostBuffer(Frontend).GhostFaces{};
+            var field_ghost_slice: []?*ghost_buffer_mod.GhostBuffer(Frontend).GhostFaces = &[_]?*ghost_buffer_mod.GhostBuffer(Frontend).GhostFaces{};
+
             if (needs_field_ghosts) {
-                const g = ghosts.?;
-                field_ghosts = g.slice(self.blocks.items.len);
-                if (@typeInfo(Inputs) == .@"struct") {
-                    field_arena = inputs[0];
-                } else {
-                    field_arena = inputs;
-                }
+                field_arena = ctx.field_in.?;
+                field_ghost_slice = ctx.field_ghosts.?.slice(self.blocks.items.len);
             }
 
-            // 1. Begin Field Exchange (Unified Local + Remote)
             var dist_state: ?FieldExchange.ExchangeState = null;
             if (needs_field_ghosts) {
-                const ctx = FieldPolicy.Context{
+                const exchange_ctx = FieldPolicy.Context{
                     .tree = self,
                     .arena = field_arena.?,
-                    .ghosts = field_ghosts,
+                    .ghosts = field_ghost_slice,
                 };
-                dist_state = try self.field_exchange.begin(ctx, self.shard_context);
+                dist_state = try self.field_exchange.begin(exchange_ctx, self.shard_context);
             }
 
-            self.pull_group.reset();
+            // Define execution context for task scheduling
+            const ExecCtx = struct {
+                k: @TypeOf(kernel),
+                idx: usize,
+                blk: *const Block,
+                apply_ctx: *ApplyContext,
+
+                fn run(ctx_ptr: *anyopaque) void {
+                    const c: *@This() = @ptrCast(@alignCast(ctx_ptr));
+                    c.k.execute(c.idx, c.blk, c.apply_ctx);
+                }
+            };
+
+            // Execute interior computation (can overlap with ghost exchange)
             self.interior_group.reset();
 
-            const ExtraPullCtx = struct {
-                k: @TypeOf(kernel),
-                block_idx: usize,
-
-                fn run(ctx_ptr: *anyopaque) void {
-                    const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr));
-                    ctx.k.ghostPull(ctx.block_idx);
-                }
-            };
-
-            const ExtraPushCtx = struct {
-                k: @TypeOf(kernel),
-                block_idx: usize,
-
-                fn run(ctx_ptr: *anyopaque) void {
-                    const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr));
-                    ctx.k.ghostPush(ctx.block_idx);
-                }
-            };
-
-            const InteriorCtx = struct {
-                k: @TypeOf(kernel),
-                idx: usize,
-                blk: *const Block,
-                in: Inputs,
-                out: Outputs,
-                g: ?*ghost_buffer_mod.GhostBuffer(Frontend),
-                f: ?*FluxRegister,
-
-                fn run(ctx_ptr: *anyopaque) void {
-                    const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr));
-                    ctx.k.executeInterior(ctx.idx, ctx.blk, ctx.in, ctx.out, ctx.g, ctx.f);
-                }
-            };
-
-            const BoundaryCtx = struct {
-                k: @TypeOf(kernel),
-                idx: usize,
-                blk: *const Block,
-                in: Inputs,
-                out: Outputs,
-                g: ?*ghost_buffer_mod.GhostBuffer(Frontend),
-                f: ?*FluxRegister,
-
-                fn run(ctx_ptr: *anyopaque) void {
-                    const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr));
-                    ctx.k.executeBoundary(ctx.idx, ctx.blk, ctx.in, ctx.out, ctx.g, ctx.f);
-                }
-            };
-
             for (self.blocks.items, 0..) |*block, idx| {
                 if (block.block_index == std.math.maxInt(usize)) continue;
 
-                if (comptime has_extra_ghosts) {
-                    if (extra_needed) {
-                        const extra_pull = self.pull_group.arena.allocatorHandle().create(ExtraPullCtx) catch {
-                            kernel.ghostPull(idx);
-                            continue;
-                        };
-                        extra_pull.* = .{ .k = kernel, .block_idx = idx };
-                        self.pull_group.submit(&self.pool, .{ .run = ExtraPullCtx.run, .ctx = extra_pull });
-                    }
-                }
-
-                var should_run = true;
-                if (Inputs != void) {
+                // Skip blocks without field slots if we have field data
+                if (ctx.field_in != null) {
                     const slot = self.getFieldSlot(idx);
-                    if (slot == std.math.maxInt(usize)) should_run = false;
+                    if (slot == std.math.maxInt(usize)) continue;
                 }
 
-                if (should_run) {
-                    const ctx = self.interior_group.arena.allocatorHandle().create(InteriorCtx) catch {
-                        kernel.executeInterior(idx, block, inputs, outputs, ghosts, flux_reg);
-                        continue;
-                    };
-                    ctx.* = .{
-                        .k = kernel,
-                        .idx = idx,
-                        .blk = block,
-                        .in = inputs,
-                        .out = outputs,
-                        .g = ghosts,
-                        .f = flux_reg,
-                    };
-                    self.interior_group.submit(&self.pool, .{ .run = InteriorCtx.run, .ctx = ctx });
-                }
+                const exec_ctx = self.interior_group.arena.allocatorHandle().create(ExecCtx) catch {
+                    kernel.execute(idx, block, ctx);
+                    continue;
+                };
+                exec_ctx.* = .{
+                    .k = kernel,
+                    .idx = idx,
+                    .blk = block,
+                    .apply_ctx = ctx,
+                };
+                self.interior_group.submit(&self.pool, .{ .run = ExecCtx.run, .ctx = exec_ctx });
             }
 
-            self.pull_group.wait();
-
-            self.push_group.reset();
-
-            if (comptime has_extra_ghosts) {
-                if (extra_needed) {
-                    for (self.blocks.items, 0..) |*block, idx| {
-                        if (block.block_index == std.math.maxInt(usize)) continue;
-                        const extra_push = self.push_group.arena.allocatorHandle().create(ExtraPushCtx) catch {
-                            kernel.ghostPush(idx);
-                            continue;
-                        };
-                        extra_push.* = .{ .k = kernel, .block_idx = idx };
-                        self.push_group.submit(&self.pool, .{ .run = ExtraPushCtx.run, .ctx = extra_push });
-                    }
-                }
-            }
-
-            self.push_group.wait();
-
-            if (comptime has_extra_ghosts) {
-                if (extra_needed) {
-                    kernel.ghostFinalize();
-                }
-            }
-
+            // Finish field ghost exchange
             if (dist_state) |*state| {
-                const ctx = FieldPolicy.Context{
+                const exchange_ctx = FieldPolicy.Context{
                     .tree = self,
                     .arena = field_arena.?,
-                    .ghosts = field_ghosts,
+                    .ghosts = field_ghost_slice,
                 };
-                try self.field_exchange.finish(ctx, state);
+                try self.field_exchange.finish(exchange_ctx, state);
             }
 
-            self.boundary_group.reset();
+            // Mark ghosts as clean
+            ctx.field_ghosts_dirty = false;
 
-            for (self.blocks.items, 0..) |*block, idx| {
-                if (block.block_index == std.math.maxInt(usize)) continue;
-
-                var should_run = true;
-                if (Inputs != void) {
-                    const slot = self.getFieldSlot(idx);
-                    if (slot == std.math.maxInt(usize)) should_run = false;
-                }
-
-                if (should_run) {
-                    const ctx = self.boundary_group.arena.allocatorHandle().create(BoundaryCtx) catch {
-                        kernel.executeBoundary(idx, block, inputs, outputs, ghosts, flux_reg);
-                        continue;
-                    };
-                    ctx.* = .{
-                        .k = kernel,
-                        .idx = idx,
-                        .blk = block,
-                        .in = inputs,
-                        .out = outputs,
-                        .g = ghosts,
-                        .f = flux_reg,
-                    };
-                    self.boundary_group.submit(&self.pool, .{ .run = BoundaryCtx.run, .ctx = ctx });
-                }
-            }
-
-            self.boundary_group.wait();
+            // Wait for all computation to complete
             self.interior_group.wait();
         }
 
@@ -753,6 +627,48 @@ pub fn AMRTree(comptime Frontend: type) type {
 
         pub fn threadCount(self: *const Self) usize {
             return self.pool.workerCount();
+        }
+
+        /// Fill ghost layers for field data.
+        /// Uses the field exchange mechanism to populate ghost buffers.
+        pub fn fillGhostLayers(
+            self: *Self,
+            arena: *const ArenaType,
+            ghosts: []?*ghost_buffer_mod.GhostBuffer(Frontend).GhostFaces,
+        ) !void {
+            const exchange_ctx = FieldPolicy.Context{
+                .tree = self,
+                .arena = arena,
+                .ghosts = ghosts,
+            };
+            var dist_state = try self.field_exchange.begin(exchange_ctx, self.shard_context);
+            try self.field_exchange.finish(exchange_ctx, &dist_state);
+        }
+
+        /// State for split ghost exchange (begin/finish pattern).
+        pub const GhostExchangeState = struct {
+            ctx: FieldPolicy.Context,
+            dist_state: FieldExchange.ExchangeState,
+        };
+
+        /// Begin a split ghost exchange. Returns state to pass to finishGhostExchange.
+        pub fn beginGhostExchange(
+            self: *Self,
+            arena: *const ArenaType,
+            ghosts: []?*ghost_buffer_mod.GhostBuffer(Frontend).GhostFaces,
+        ) !GhostExchangeState {
+            const exchange_ctx = FieldPolicy.Context{
+                .tree = self,
+                .arena = arena,
+                .ghosts = ghosts,
+            };
+            const dist_state = try self.field_exchange.begin(exchange_ctx, self.shard_context);
+            return .{ .ctx = exchange_ctx, .dist_state = dist_state };
+        }
+
+        /// Finish a split ghost exchange started with beginGhostExchange.
+        pub fn finishGhostExchange(self: *Self, state: *GhostExchangeState) !void {
+            try self.field_exchange.finish(state.ctx, &state.dist_state);
         }
 
         pub fn getBlock(self: *const Self, idx: usize) ?*const Block {

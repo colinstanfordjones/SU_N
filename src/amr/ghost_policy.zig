@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const dist_exchange = @import("dist_exchange.zig");
+const field_math = @import("field_math.zig");
 
 /// Interface for Ghost Policy.
 /// Types matching this interface can be used with DistGhostExchange.
@@ -202,7 +203,7 @@ fn restrictFineFaceToCoarse(
             fine_base[k] = coarse_coords[k] * 2;
         }
 
-        var sum: Field = zeroField(Field);
+        var sum: Field = field_math.zeroField(Field);
         for (0..num_fine) |fine_sub| {
             var fine_coords: [Nd - 1]usize = undefined;
             inline for (0..Nd - 1) |k| {
@@ -215,11 +216,11 @@ fn restrictFineFaceToCoarse(
             }
 
             if (fine_idx < fine_face.len) {
-                sum = addField(Field, sum, fine_face[fine_idx]);
+                sum = field_math.addField(Field, sum, fine_face[fine_idx]);
             }
         }
 
-        const avg = scaleField(Field, sum, scale);
+        const avg = field_math.scaleField(Field, sum, scale);
 
         var coarse_idx: usize = 0;
         inline for (0..Nd - 1) |k| {
@@ -240,79 +241,7 @@ fn restrictFineFaceToCoarse(
 
 fn addFace(comptime Field: type, dst: []Field, src: []const Field) void {
     for (dst, src) |*d, s| {
-        d.* = addField(Field, d.*, s);
+        d.* = field_math.addField(Field, d.*, s);
     }
 }
 
-fn isComplex(comptime T: type) bool {
-    return @typeInfo(T) == .@"struct" and @hasField(T, "re") and @hasField(T, "im");
-}
-
-fn zeroField(comptime Field: type) Field {
-    const info = @typeInfo(Field);
-
-    if (info == .array) {
-        const Child = std.meta.Child(Field);
-        const len = info.array.len;
-        var result: Field = undefined;
-        inline for (0..len) |i| {
-            result[i] = zeroElement(Child);
-        }
-        return result;
-    }
-
-    return zeroElement(Field);
-}
-
-fn zeroElement(comptime T: type) T {
-    if (comptime isComplex(T)) {
-        return @as(T, std.math.Complex(f64).init(0, 0));
-    }
-    return @as(T, 0);
-}
-
-fn addField(comptime Field: type, a: Field, b: Field) Field {
-    const info = @typeInfo(Field);
-
-    if (info == .array) {
-        const Child = std.meta.Child(Field);
-        const len = info.array.len;
-        var result: Field = undefined;
-        inline for (0..len) |i| {
-            result[i] = addElement(Child, a[i], b[i]);
-        }
-        return result;
-    }
-
-    return addElement(Field, a, b);
-}
-
-fn addElement(comptime T: type, a: T, b: T) T {
-    if (comptime isComplex(T)) {
-        return @as(T, .{ .re = a.re + b.re, .im = a.im + b.im });
-    }
-    return @as(T, a + b);
-}
-
-fn scaleField(comptime Field: type, value: Field, scale: f64) Field {
-    const info = @typeInfo(Field);
-
-    if (info == .array) {
-        const Child = std.meta.Child(Field);
-        const len = info.array.len;
-        var result: Field = undefined;
-        inline for (0..len) |i| {
-            result[i] = scaleElement(Child, value[i], scale);
-        }
-        return result;
-    }
-
-    return scaleElement(Field, value, scale);
-}
-
-fn scaleElement(comptime T: type, value: T, scale: f64) T {
-    if (comptime isComplex(T)) {
-        return @as(T, .{ .re = value.re * scale, .im = value.im * scale });
-    }
-    return @as(T, value * @as(T, @floatCast(scale)));
-}

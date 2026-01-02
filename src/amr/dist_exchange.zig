@@ -431,14 +431,16 @@ pub fn DistExchange(comptime Tree: type, comptime Context: type, comptime Payloa
     };
 }
 
-// Helpers duplicated because they are private in ghost_mpi.
-// Long-term: move these to a shared topology utility or expose Tree helpers.
+// =============================================================================
+// Neighbor Discovery Helpers
+// =============================================================================
+//
+// These helpers are intentionally local to this module for isolation.
+// They provide neighbor-finding logic specific to distributed exchange.
 
 fn maxFineNeighbors(comptime Nd_: usize) usize {
     return @as(usize, 1) << @intCast(Nd_ - 1);
 }
-
-// Helper logic copied from the earlier ghost exchange implementation.
 
 fn findNeighborKey(
     tree: anytype,

@@ -17,8 +17,10 @@
 //! var gauge_tree = try GaugeTree.init(allocator, 1.0, 4, 8);
 //! defer gauge_tree.deinit();
 //!
-//! var psi_arena = try FieldArena.init(allocator, 256);
-//! defer psi_arena.deinit();
+//! var psi_in = try FieldArena.init(allocator, 256);
+//! var psi_out = try FieldArena.init(allocator, 256);
+//! defer psi_in.deinit();
+//! defer psi_out.deinit();
 //!
 //! const HAMR = physics.hamiltonian_amr.HamiltonianAMR(Frontend);
 //! var H = HAMR.init(&gauge_tree, mass, potential_fn);
@@ -26,7 +28,10 @@
 //! var ghosts = try amr.GhostBuffer(Frontend).init(allocator, 256);
 //! defer ghosts.deinit();
 //!
-//! try H.apply(&psi_arena, &workspace, &ghosts);
+//! var ctx = GaugeTree.TreeType.ApplyContext.init(&gauge_tree.tree);
+//! ctx.setFields(&psi_in, &psi_out);
+//! ctx.setFieldGhosts(&ghosts);
+//! try gauge_tree.apply(&H, &ctx);
 //! ```
 //!
 //! ## Gauge-Covariant Laplacian
@@ -45,7 +50,7 @@ const Complex = std.math.Complex(f64);
 /// AMR Hamiltonian for multi-scale lattice computations.
 ///
 /// Uses GaugeTree for gauge-covariant operations (Laplacian, link access).
-/// Manages only psi field ghost layers internally.
+/// Stateless kernel that operates via ApplyContext.
 pub fn HamiltonianAMR(comptime Frontend: type) type {
     if (!@hasDecl(Frontend, "gauge_group_dim")) {
         @compileError("HamiltonianAMR requires a GaugeFrontend with gauge_group_dim");
@@ -61,6 +66,7 @@ pub fn HamiltonianAMR(comptime Frontend: type) type {
     const GaugeTree = gauge_mod.GaugeTree(Frontend);
     const Block = amr_mod.AMRBlock(Frontend);
     const FieldArena = amr_mod.FieldArena(Frontend);
+    const ApplyContext = amr_mod.ApplyContext(Frontend);
 
     const num_faces = 2 * Nd;
 
@@ -83,9 +89,6 @@ pub fn HamiltonianAMR(comptime Frontend: type) type {
         /// Potential function
         potential_fn: *const fn ([Nd]f64, f64) f64,
 
-        /// Persistent MPI exchange state for overlapping
-        dist_state: ?GaugeTree.LinkExchange.ExchangeState = null,
-
         /// Current time step (for flux register)
         current_dt: f64 = 0.0,
 
@@ -99,13 +102,8 @@ pub fn HamiltonianAMR(comptime Frontend: type) type {
                 .gauge_tree = gauge_tree,
                 .mass = mass,
                 .potential_fn = potential_fn,
-                .dist_state = null,
                 .current_dt = 0.0,
             };
-        }
-
-        pub fn deinit(self: *Self) void {
-            _ = self;
         }
 
         /// Get the underlying tree reference
@@ -113,98 +111,117 @@ pub fn HamiltonianAMR(comptime Frontend: type) type {
             return &self.gauge_tree.tree;
         }
 
-        pub fn ghostPrepare(self: *Self) !bool {
-            _ = try self.gauge_tree.prepareLinkGhostExchange();
-            if (self.gauge_tree.shardContext()) |s| {
-                self.dist_state = try self.gauge_tree.beginExchange(s);
-            }
-            return true;
-        }
-
-        pub fn ghostPull(self: *Self, block_idx: usize) void {
-            self.gauge_tree.fillGhostsPull(block_idx);
-        }
-
-        pub fn ghostPush(self: *Self, block_idx: usize) void {
-            self.gauge_tree.fillGhostsPush(block_idx);
-        }
-
-        pub fn ghostFinalize(self: *Self) void {
-            if (self.dist_state) |*s| {
-                self.gauge_tree.finishExchange(s) catch {};
-                self.dist_state = null;
-            }
-            self.gauge_tree.finalizeLinkGhostExchange();
-        }
-
-        pub fn executeInterior(
+        /// Execute the Hamiltonian on a single block.
+        /// This is the kernel interface for AMRTree.apply().
+        pub fn execute(
             self: *const Self,
             block_idx: usize,
             block: *const Block,
-            psi_in: *const FieldArena,
-            psi_out: *FieldArena,
-            ghosts: ?*GhostBuffer,
-            flux_reg: ?*GaugeTree.TreeType.FluxRegister,
+            ctx: *ApplyContext,
         ) void {
-            _ = flux_reg;
-            @constCast(self).executeRegion(.interior, block_idx, block, psi_in, psi_out, ghosts);
+            const tree = ctx.tree;
+            const slot = tree.getFieldSlot(block_idx);
+            if (slot == std.math.maxInt(usize)) return;
+
+            const psi_in_arena = ctx.field_in orelse return;
+            const psi_out_arena = ctx.field_out orelse return;
+
+            const psi = psi_in_arena.getSlotConst(slot);
+            const out = psi_out_arena.getSlot(slot);
+
+            // Get ghost slices
+            var psi_ghost_slices: [num_faces][]const FieldType = undefined;
+            for (0..num_faces) |f| {
+                psi_ghost_slices[f] = &.{};
+            }
+
+            if (ctx.field_ghosts) |ghosts| {
+                if (ghosts.get(block_idx)) |gp| {
+                    for (0..num_faces) |f| {
+                        psi_ghost_slices[f] = &gp[f];
+                    }
+                }
+            }
+
+            // Apply Hamiltonian to all sites
+            self.applyToBlock(block_idx, block, psi, out, psi_ghost_slices);
+
+            // Handle flux register if present
+            if (ctx.flux_reg) |fr| {
+                self.computeFluxes(fr, tree, block_idx, psi, psi_ghost_slices, block.spacing);
+            }
         }
 
-        pub fn executeBoundary(
+        fn applyToBlock(
             self: *const Self,
             block_idx: usize,
             block: *const Block,
-            psi_in: *const FieldArena,
-            psi_out: *FieldArena,
-            ghosts: ?*GhostBuffer,
-            flux_reg: ?*GaugeTree.TreeType.FluxRegister,
+            psi_in: []const FieldType,
+            psi_out: []FieldType,
+            psi_ghost_slices: [num_faces][]const FieldType,
         ) void {
-            @constCast(self).executeRegion(.boundary, block_idx, block, psi_in, psi_out, ghosts);
+            const spacing = block.spacing;
+            const kinetic_pf = -1.0 / (2.0 * self.mass);
 
-            if (flux_reg) |fr| {
-                const tree = &self.gauge_tree.tree;
-                const slot = tree.getFieldSlot(block_idx);
-                const in = psi_in.getSlotConst(slot);
-                const h = block.spacing;
+            for (0..block_volume) |i| {
+                // Use GaugeTree's covariant Laplacian (already includes 1/a²)
+                const laplacian = self.gauge_tree.covariantLaplacianSite(
+                    block_idx,
+                    i,
+                    psi_in,
+                    psi_ghost_slices,
+                    spacing,
+                );
 
-                // Get ghost slices
-                var psi_ghost_slices: [num_faces][]const FieldType = undefined;
-                for (0..num_faces) |f| {
-                    psi_ghost_slices[f] = &.{};
+                // Apply potential
+                const pos = block.getPhysicalPosition(i);
+                const potential = self.potential_fn(pos, spacing);
+
+                // H·ψ = kinetic + potential
+                inline for (0..N_field) |a| {
+                    const kinetic = laplacian[a].mul(Complex.init(kinetic_pf, 0));
+                    const pot_term = psi_in[i][a].mul(Complex.init(potential, 0));
+                    psi_out[i][a] = kinetic.add(pot_term);
                 }
-                if (ghosts) |g| {
-                    if (g.get(block_idx)) |gp| {
-                        inline for (0..num_faces) |f| psi_ghost_slices[f] = &gp[f];
+            }
+        }
+
+        fn computeFluxes(
+            self: *const Self,
+            fr: anytype,
+            tree: anytype,
+            block_idx: usize,
+            psi_in: []const FieldType,
+            ghosts: [num_faces][]const FieldType,
+            h: f64,
+        ) void {
+            inline for (0..num_faces) |face| {
+                const neighbor = tree.neighborInfo(block_idx, face);
+                var is_cf = false;
+                var is_fc = false;
+
+                if (neighbor.exists() and neighbor.level_diff == -1) {
+                    is_fc = true;
+                } else if (!neighbor.exists()) {
+                    var fine_neighbors: [GaugeTree.TreeType.max_fine_neighbors]usize = undefined;
+                    if (tree.collectFineNeighbors(block_idx, face, &fine_neighbors) > 0) {
+                        is_cf = true;
                     }
                 }
 
-                inline for (0..num_faces) |face| {
-                    const neighbor = tree.neighborInfo(block_idx, face);
-                    var is_cf = false;
-                    var is_fc = false;
-
-                    if (neighbor.exists() and neighbor.level_diff == -1) {
-                        is_fc = true; // We are Fine, Neighbor Coarse
-                    } else if (!neighbor.exists()) {
-                        var fine_neighbors: [GaugeTree.TreeType.max_fine_neighbors]usize = undefined;
-                        if (tree.collectFineNeighbors(block_idx, face, &fine_neighbors) > 0) {
-                            is_cf = true; // We are Coarse, Neighbor Fine
-                        }
-                    }
-
-                    if (is_fc) {
-                        self.computeAndAddFlux(fr, block_idx, in, psi_ghost_slices, face, h, true);
-                    }
-                    if (is_cf) {
-                        self.computeAndAddFlux(fr, block_idx, in, psi_ghost_slices, face, h, false);
-                    }
+                if (is_fc) {
+                    self.computeAndAddFlux(fr, tree, block_idx, psi_in, ghosts, face, h, true);
+                }
+                if (is_cf) {
+                    self.computeAndAddFlux(fr, tree, block_idx, psi_in, ghosts, face, h, false);
                 }
             }
         }
 
         fn computeAndAddFlux(
             self: *const Self,
-            fr: *GaugeTree.TreeType.FluxRegister,
+            fr: anytype,
+            tree: anytype,
             block_idx: usize,
             in: []const FieldType,
             ghosts: [num_faces][]const FieldType,
@@ -215,7 +232,6 @@ pub fn HamiltonianAMR(comptime Frontend: type) type {
             const LinkType = Frontend.LinkType;
             const dim = face / 2;
             const is_upper = (face % 2) == 0;
-            const tree = &self.gauge_tree.tree;
 
             const face_cells = Block.ghost_face_size;
             var flux_face: [face_cells]FieldType = undefined;
@@ -244,7 +260,6 @@ pub fn HamiltonianAMR(comptime Frontend: type) type {
                 var grad: FieldType = undefined;
 
                 if (is_upper) {
-                    // Flux F+ = D+ psi = (U psi(x+mu) - psi(x))/h
                     const link = self.gauge_tree.getLink(block_idx, idx, dim);
 
                     var psi_outer: FieldType = undefined;
@@ -260,7 +275,6 @@ pub fn HamiltonianAMR(comptime Frontend: type) type {
                         grad[a] = transported[a].sub(psi_val[a]).mul(Complex.init(1.0 / h, 0));
                     }
                 } else {
-                    // Flux F- = D- psi = (psi(x) - Udagger psi(x-mu))/h
                     var link_dag: LinkType = LinkType.identity();
 
                     const neighbor_info = tree.neighborInfo(block_idx, face);
@@ -302,7 +316,7 @@ pub fn HamiltonianAMR(comptime Frontend: type) type {
         }
 
         /// Apply the Hamiltonian: H·ψ = (-ℏ²/2m)∇²ψ + V·ψ.
-        /// Wrapper around AMRTree.apply(self, ...).
+        /// Convenience wrapper that creates ApplyContext and calls tree.apply().
         pub fn apply(
             self: *Self,
             psi_in: *const FieldArena,
@@ -310,99 +324,15 @@ pub fn HamiltonianAMR(comptime Frontend: type) type {
             ghosts: *GhostBuffer,
             flux_reg: ?*GaugeTree.TreeType.FluxRegister,
         ) !void {
-            try self.gauge_tree.tree.apply(self, psi_in, psi_out, ghosts, flux_reg);
-        }
+            // Build ApplyContext
+            var ctx = ApplyContext.init(&self.gauge_tree.tree);
+            ctx.field_in = psi_in;
+            ctx.field_out = psi_out;
+            ctx.field_ghosts = ghosts;
+            ctx.flux_reg = flux_reg;
+            ctx.dt = self.current_dt;
 
-        fn applyToBlock(
-            self: *Self,
-            block_idx: usize,
-            block: *const Block,
-            psi_in: []const FieldType,
-            psi_out: []FieldType,
-            psi_ghost_slices: [num_faces][]const FieldType,
-        ) void {
-            self.applyToBlockRegion(.all, block_idx, block, psi_in, psi_out, psi_ghost_slices);
-        }
-
-        const SiteRegion = enum {
-            all,
-            interior,
-            boundary,
-        };
-
-        fn executeRegion(
-            self: *Self,
-            region: SiteRegion,
-            block_idx: usize,
-            block: *const Block,
-            inputs: anytype,
-            outputs: anytype,
-            ghosts: ?*GhostBuffer,
-        ) void {
-            const psi_in_arena = inputs;
-            const psi_out_arena = outputs;
-
-            const slot = self.gauge_tree.tree.getFieldSlot(block_idx);
-            const psi = psi_in_arena.getSlotConst(slot);
-            const out = psi_out_arena.getSlot(slot);
-
-            var psi_ghost_slices: [num_faces][]const FieldType = undefined;
-            for (0..num_faces) |f| {
-                psi_ghost_slices[f] = &.{};
-            }
-
-            if (ghosts) |g| {
-                if (g.get(block_idx)) |gp| {
-                    for (0..num_faces) |f| {
-                        psi_ghost_slices[f] = &gp[f];
-                    }
-                }
-            }
-
-            self.applyToBlockRegion(region, block_idx, block, psi, out, psi_ghost_slices);
-        }
-
-        fn applyToBlockRegion(
-            self: *Self,
-            region: SiteRegion,
-            block_idx: usize,
-            block: *const Block,
-            psi_in: []const FieldType,
-            psi_out: []FieldType,
-            psi_ghost_slices: [num_faces][]const FieldType,
-        ) void {
-            const spacing = block.spacing;
-            const kinetic_pf = -1.0 / (2.0 * self.mass);
-
-            for (0..block_volume) |i| {
-                const coords = Block.getLocalCoords(i);
-                const on_boundary = Block.isOnBoundary(coords);
-                switch (region) {
-                    .all => {},
-                    .interior => if (on_boundary) continue,
-                    .boundary => if (!on_boundary) continue,
-                }
-
-                // Use GaugeTree's covariant Laplacian (already includes 1/a²)
-                const laplacian = self.gauge_tree.covariantLaplacianSite(
-                    block_idx,
-                    i,
-                    psi_in,
-                    psi_ghost_slices,
-                    spacing,
-                );
-
-                // Apply potential
-                const pos = block.getPhysicalPosition(i);
-                const potential = self.potential_fn(pos, spacing);
-
-                // H·ψ = kinetic + potential
-                inline for (0..N_field) |a| {
-                    const kinetic = laplacian[a].mul(Complex.init(kinetic_pf, 0));
-                    const pot_term = psi_in[i][a].mul(Complex.init(potential, 0));
-                    psi_out[i][a] = kinetic.add(pot_term);
-                }
-            }
+            try self.gauge_tree.apply(self, &ctx);
         }
 
         // =====================================================================
@@ -443,7 +373,6 @@ pub fn HamiltonianAMR(comptime Frontend: type) type {
                 }
             }
 
-            // Guard against divide-by-zero (empty arena or all-zero fields)
             if (norm_sq <= 0.0 or !std.math.isFinite(norm_sq)) return 0.0;
             return expectation / norm_sq;
         }
@@ -514,9 +443,8 @@ pub fn HamiltonianAMR(comptime Frontend: type) type {
             adapt_hysteresis: f64,
         ) !void {
             const dt = Complex.init(delta_tau, 0);
-            self.current_dt = delta_tau; // Set DT for flux register
+            self.current_dt = delta_tau;
 
-            // Init FluxRegister
             var flux_reg = GaugeTree.TreeType.FluxRegister.init(self.gauge_tree.allocator);
             defer flux_reg.deinit();
 
@@ -543,7 +471,6 @@ pub fn HamiltonianAMR(comptime Frontend: type) type {
                     }
                 }
 
-                // Reflux correction
                 flux_reg.reflux(&self.gauge_tree.tree, psi_arena);
 
                 if (normalize_interval > 0 and (step + 1) % normalize_interval == 0) {
@@ -576,9 +503,8 @@ pub fn HamiltonianAMR(comptime Frontend: type) type {
             const convergence_check_interval = constants.evolution_convergence_check_interval;
             var prev_energy = try self.measureEnergy(psi_arena, workspace, ghosts);
             const dt = Complex.init(delta_tau, 0);
-            self.current_dt = delta_tau; // Set DT for flux register
+            self.current_dt = delta_tau;
 
-            // Init FluxRegister
             var flux_reg = GaugeTree.TreeType.FluxRegister.init(self.gauge_tree.allocator);
             defer flux_reg.deinit();
 
@@ -605,7 +531,6 @@ pub fn HamiltonianAMR(comptime Frontend: type) type {
                     }
                 }
 
-                // Reflux correction
                 flux_reg.reflux(&self.gauge_tree.tree, psi_arena);
 
                 if (normalize_interval > 0 and (step + 1) % normalize_interval == 0) {

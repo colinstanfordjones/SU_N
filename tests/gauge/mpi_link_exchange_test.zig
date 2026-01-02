@@ -45,10 +45,10 @@ test "mpi gauge link exchange uses full face payload" {
     );
     defer shard.deinit();
 
-    tree.attachShard(&shard);
-    try tree.fillGhosts();
+    tree.tree.attachShard(&shard);
+    try tree.field.fillGhosts(&tree.tree);
 
-    const ghost = &tree.ghosts.items[block_idx];
+    const ghost = tree.field.ghosts.get(block_idx).?;
     const face_idx: usize = if (rank == 0) 0 else 1;
     const expected = @as(f64, @floatFromInt((1 - rank) + 2));
     inline for (0..Nd) |link_dim| {

@@ -13,6 +13,7 @@ const Tree = amr.AMRTree(HeatFrontend);
 const Block = amr.AMRBlock(HeatFrontend);
 const Arena = amr.FieldArena(HeatFrontend);
 const GhostBuffer = amr.GhostBuffer(HeatFrontend);
+const ApplyContext = amr.ApplyContext(HeatFrontend);
 
 const Complex = std.math.Complex(f64);
 
@@ -30,28 +31,30 @@ const ComplexTree = TreeComplex;
 const ComplexBlock = ComplexTree.BlockType;
 const ComplexArena = ComplexTree.FieldArenaType;
 const ComplexGhostBuffer = amr.GhostBuffer(ComplexFrontend);
+const ComplexApplyContext = amr.ApplyContext(ComplexFrontend);
 
 const RealHeatKernel = struct {
     tree: *const Tree,
     alpha: f64,
     dt: f64,
 
-    fn execute(
+    pub fn execute(
         self: *const RealHeatKernel,
         block_idx: usize,
         _: *const Block,
-        psi_in: *const Arena,
-        psi_out: *Arena,
-        ghosts: ?*GhostBuffer,
+        ctx: *ApplyContext,
     ) void {
         const slot = self.tree.getFieldSlot(block_idx);
+        const psi_in = ctx.field_in orelse return;
+        const psi_out = ctx.field_out orelse return;
+
         const in = psi_in.getSlotConst(slot);
         const out = psi_out.getSlot(slot);
 
         var ghost_slices: [2 * Nd][]const f64 = undefined;
         for (0..2 * Nd) |f| ghost_slices[f] = &.{};
-        if (ghosts) |g| {
-            if (g.get(block_idx)) |gp| {
+        if (ctx.field_ghosts) |ghosts| {
+            if (ghosts.get(block_idx)) |gp| {
                 for (0..2 * Nd) |f| ghost_slices[f] = &gp[f];
             }
         }
@@ -98,60 +101,29 @@ const RealHeatKernel = struct {
             out[i] = in[i] + self.alpha * self.dt * sum;
         }
     }
-
-    pub fn executeInterior(
-        self: *const RealHeatKernel,
-        block_idx: usize,
-        block: *const Block,
-        psi_in: *const Arena,
-        psi_out: *Arena,
-        ghosts: ?*GhostBuffer,
-        flux_reg: ?*Tree.FluxRegister,
-    ) void {
-        _ = flux_reg;
-        self.execute(block_idx, block, psi_in, psi_out, ghosts);
-    }
-
-    pub fn executeBoundary(
-        self: *const RealHeatKernel,
-        block_idx: usize,
-        block: *const Block,
-        psi_in: *const Arena,
-        psi_out: *Arena,
-        ghosts: ?*GhostBuffer,
-        flux_reg: ?*Tree.FluxRegister,
-    ) void {
-        _ = flux_reg;
-        self.execute(block_idx, block, psi_in, psi_out, ghosts);
-    }
 };
 
 const ComplexHeatKernel = struct {
     tree: *const ComplexTree,
     alpha: f64,
 
-    fn execute(
+    pub fn execute(
         self: *const ComplexHeatKernel,
         block_idx: usize,
         _: *const ComplexBlock,
-        psi_in: *const ComplexArena,
-        psi_out: *const ComplexArena, // Wait, output should be mutable pointer, likely inferred or passed as such.
-        // Actually, in the test usage, it is `*ComplexArena`.
-        // But let's check `executeInterior` signature in test file first...
-        // It was `psi_out: *FieldArena` which is mutable.
-        ghosts: ?*ComplexGhostBuffer,
+        ctx: *ComplexApplyContext,
     ) void {
-        // Cast away constness if needed, or fix signature.
-        // In `executeInterior`, `psi_out` is `*ComplexArena`.
-        // So `execute` should take `*ComplexArena`.
-        // Let's assume standard mutable pointer for output.
         const slot = self.tree.getFieldSlot(block_idx);
+        const psi_in = ctx.field_in orelse return;
+        const psi_out = ctx.field_out orelse return;
+
         const in = psi_in.getSlotConst(slot);
         const out = psi_out.getSlot(slot);
 
         var ghost_slices: [2 * Nd][]const Complex = undefined;
-        if (ghosts) |g| {
-            if (g.get(block_idx)) |gp| {
+        for (0..2 * Nd) |f| ghost_slices[f] = &.{};
+        if (ctx.field_ghosts) |ghosts| {
+            if (ghosts.get(block_idx)) |gp| {
                 for (0..2 * Nd) |f| ghost_slices[f] = gp[f];
             }
         }
@@ -197,32 +169,6 @@ const ComplexHeatKernel = struct {
             out[i] = in[i].add(sum.mul(Complex.init(self.alpha, 0)));
         }
     }
-
-    pub fn executeInterior(
-        self: *const ComplexHeatKernel,
-        block_idx: usize,
-        block: *const ComplexBlock,
-        psi_in: *const ComplexArena,
-        psi_out: *ComplexArena,
-        ghosts: ?*ComplexGhostBuffer,
-        flux_reg: ?*ComplexTree.FluxRegister,
-    ) void {
-        _ = flux_reg;
-        self.execute(block_idx, block, psi_in, psi_out, ghosts);
-    }
-
-    pub fn executeBoundary(
-        self: *const ComplexHeatKernel,
-        block_idx: usize,
-        block: *const ComplexBlock,
-        psi_in: *const ComplexArena,
-        psi_out: *ComplexArena,
-        ghosts: ?*ComplexGhostBuffer,
-        flux_reg: ?*ComplexTree.FluxRegister,
-    ) void {
-        _ = flux_reg;
-        self.execute(block_idx, block, psi_in, psi_out, ghosts);
-    }
 };
 
 test "Heat Equation Diffusion" {
@@ -253,7 +199,11 @@ test "Heat Equation Diffusion" {
 
     // Step
     var kernel = RealHeatKernel{ .tree = &tree, .alpha = 1.0, .dt = 0.1 };
-    try tree.apply(&kernel, &arena, &arena_out, &ghosts, null);
+    var ctx = ApplyContext.init(&tree);
+    ctx.field_in = &arena;
+    ctx.field_out = &arena_out;
+    ctx.field_ghosts = &ghosts;
+    try tree.apply(&kernel, &ctx);
 
     // Verify diffusion (peak should decrease)
     const u_new = arena_out.getSlot(slot);

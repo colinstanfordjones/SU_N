@@ -6,6 +6,7 @@
 const std = @import("std");
 const root = @import("root.zig");
 const amr_block = @import("block.zig");
+const field_math = @import("field_math.zig");
 
 /// Geometric Multigrid solver for AMR hierarchies.
 pub fn Multigrid(comptime Tree: type) type {
@@ -99,11 +100,11 @@ pub fn Multigrid(comptime Tree: type) type {
                         f_rem /= 2;
                     }
                     const fine_site = Block.getLocalIndex(fine_coords);
-                    sum = addFields(sum, fine[fine_site]);
+                    sum = field_math.addField(FieldType, sum, fine[fine_site]);
                 }
 
                 const factor = 1.0 / @as(f64, @floatFromInt(@as(usize, 1) << Nd));
-                coarse[coarse_site] = scaleField(sum, factor);
+                coarse[coarse_site] = field_math.scaleField(FieldType, sum, factor);
             }
         }
 
@@ -178,7 +179,7 @@ pub fn Multigrid(comptime Tree: type) type {
                 }
                 const c_site = Block.getLocalIndex(coarse_coords);
                 if (add) {
-                    fine[f_site] = addFields(fine[f_site], coarse[c_site]);
+                    fine[f_site] = field_math.addField(FieldType, fine[f_site], coarse[c_site]);
                 } else {
                     fine[f_site] = coarse[c_site];
                 }
@@ -262,23 +263,5 @@ pub fn Multigrid(comptime Tree: type) type {
             return offset;
         }
 
-        fn addFields(a: FieldType, b: FieldType) FieldType {
-            var res: FieldType = undefined;
-            const N_field = Frontend.field_dim;
-            inline for (0..N_field) |i| {
-                res[i] = a[i].add(b[i]);
-            }
-            return res;
-        }
-
-        fn scaleField(f: FieldType, s: f64) FieldType {
-            var res: FieldType = undefined;
-            const N_field = Frontend.field_dim;
-            const factor = std.math.Complex(f64).init(s, 0);
-            inline for (0..N_field) |i| {
-                res[i] = f[i].mul(factor);
-            }
-            return res;
-        }
     };
 }

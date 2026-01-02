@@ -17,6 +17,7 @@
 //! Finally, `reflux` modifies the coarse face cells: `U_crse += R / Volume_crse`.
 
 const std = @import("std");
+const field_math = @import("field_math.zig");
 
 var flux_register_cookie: std.atomic.Value(u64) = std.atomic.Value(u64).init(1);
 
@@ -200,11 +201,11 @@ pub fn FluxRegister(comptime Tree: type) type {
             const local = try self.getLocalRegister();
             const entry = try self.getOrPutRegister(local, key);
             if (!entry.found_existing) {
-                entry.value_ptr.* = zeroField(FaceField);
+                entry.value_ptr.* = field_math.zeroField(FaceField);
             }
 
             // R -= F_coarse * scale
-            addScaledField(FaceField, entry.value_ptr, flux, -scale);
+            field_math.addScaledField(FaceField, entry.value_ptr, flux, -scale);
         }
 
         /// Record flux from a Fine block at a C-F interface.
@@ -239,7 +240,7 @@ pub fn FluxRegister(comptime Tree: type) type {
                 const local = try self.getLocalRegister();
                 const entry = try self.getOrPutRegister(local, coarse_key);
                 if (!entry.found_existing) {
-                    entry.value_ptr.* = zeroField(FaceField);
+                    entry.value_ptr.* = field_math.zeroField(FaceField);
                 }
 
                 const dim = face / 2;
@@ -267,7 +268,7 @@ pub fn FluxRegister(comptime Tree: type) type {
                 const map = fine_to_coarse_face_idx[dim][mask];
                 for (0..face_cells) |fine_face_idx| {
                     const coarse_face_idx = @as(usize, @intCast(map[fine_face_idx]));
-                    addScaledField(FieldType, &entry.value_ptr.*[coarse_face_idx], flux[fine_face_idx], scale);
+                    field_math.addScaledField(FieldType, &entry.value_ptr.*[coarse_face_idx], flux[fine_face_idx], scale);
                 }
             }
         }
@@ -316,9 +317,9 @@ pub fn FluxRegister(comptime Tree: type) type {
                 const key = entry.key_ptr.*;
                 const reduced_entry = try dst.getOrPut(key);
                 if (!reduced_entry.found_existing) {
-                    reduced_entry.value_ptr.* = zeroField(FaceField);
+                    reduced_entry.value_ptr.* = field_math.zeroField(FaceField);
                 }
-                addScaledField(FaceField, reduced_entry.value_ptr, entry.value_ptr.*, 1.0);
+                field_math.addScaledField(FaceField, reduced_entry.value_ptr, entry.value_ptr.*, 1.0);
             }
         }
 
@@ -408,75 +409,6 @@ pub fn FluxRegister(comptime Tree: type) type {
     };
 }
 
-// Helpers
-fn zeroField(comptime FieldType: type) FieldType {
-    const info = @typeInfo(FieldType);
-    if (info == .array) {
-        const Child = std.meta.Child(FieldType);
-        var res: FieldType = undefined;
-        for (0..info.array.len) |i| res[i] = zeroField(Child);
-        return res;
-    }
-    return zeroElement(FieldType);
-}
-
-fn zeroElement(comptime T: type) T {
-    if (comptime isComplex(T)) return T.init(0, 0);
-    return @as(T, 0);
-}
-
-fn addField(comptime FieldType: type, a: FieldType, b: FieldType) FieldType {
-    const info = @typeInfo(FieldType);
-    if (info == .array) {
-        const Child = std.meta.Child(FieldType);
-        var res: FieldType = undefined;
-        for (0..info.array.len) |i| res[i] = addField(Child, a[i], b[i]);
-        return res;
-    }
-    return addElement(a, b);
-}
-
-fn addElement(a: anytype, b: anytype) @TypeOf(a) {
-    if (comptime isComplex(@TypeOf(a))) return a.add(b);
-    return a + b;
-}
-
-fn scaleField(comptime FieldType: type, val: FieldType, s: f64) FieldType {
-    const info = @typeInfo(FieldType);
-    if (info == .array) {
-        const Child = std.meta.Child(FieldType);
-        var res: FieldType = undefined;
-        for (0..info.array.len) |i| res[i] = scaleField(Child, val[i], s);
-        return res;
-    }
-    return scaleElement(val, s);
-}
-
-fn scaleElement(val: anytype, s: f64) @TypeOf(val) {
-    if (comptime isComplex(@TypeOf(val))) return val.mul(@TypeOf(val).init(s, 0));
-    return val * s;
-}
-
-fn addScaledField(comptime FieldType: type, dest: *FieldType, src: FieldType, s: f64) void {
-    const info = @typeInfo(FieldType);
-    if (info == .array) {
-        const Child = std.meta.Child(FieldType);
-        for (0..info.array.len) |i| {
-            addScaledField(Child, &dest.*[i], src[i], s);
-        }
-        return;
-    }
-    if (comptime isComplex(FieldType)) {
-        dest.* = dest.*.add(src.mul(FieldType.init(s, 0)));
-    } else {
-        dest.* += src * s;
-    }
-}
-
-fn isComplex(comptime T: type) bool {
-    return @typeInfo(T) == .@"struct" and @hasField(T, "re") and @hasField(T, "im");
-}
-
 fn applyRefluxCorrection(
     comptime Tree: type,
     field: []Tree.FieldType,
@@ -518,7 +450,7 @@ fn applyRefluxCorrection(
         }
 
         const idx = Tree.BlockType.getLocalIndex(coords);
-        const dens_correction = scaleField(Tree.FieldType, correction[face_idx], sign / v_cell);
-        field[idx] = addField(Tree.FieldType, field[idx], dens_correction);
+        const dens_correction = field_math.scaleField(Tree.FieldType, correction[face_idx], sign / v_cell);
+        field[idx] = field_math.addField(Tree.FieldType, field[idx], dens_correction);
     }
 }

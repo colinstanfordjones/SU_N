@@ -20,6 +20,7 @@ test "HamiltonianAMR pipeline matches bulk sync" {
     const FieldArena = GT.FieldArena;
     const GhostBuffer = amr.GhostBuffer(Frontend);
     const HAMR = physics.hamiltonian_amr.HamiltonianAMR(Frontend);
+    const ApplyContext = amr.ApplyContext(Frontend);
     const Block = GT.BlockType;
 
     var psi_arena = try FieldArena.init(std.testing.allocator, 16);
@@ -64,17 +65,24 @@ test "HamiltonianAMR pipeline matches bulk sync" {
     }
 
     try ghosts.ensureForTree(&gauge_tree.tree);
-    amr.ghost.fillGhostLayers(GT.TreeType, &gauge_tree.tree, &psi_arena, ghosts.slice(gauge_tree.tree.blocks.items.len));
+    try gauge_tree.tree.fillGhostLayers(&psi_arena, ghosts.slice(gauge_tree.tree.blocks.items.len));
     try gauge_tree.fillGhosts();
+
+    // Manual bulk sync: iterate blocks and call execute() with ApplyContext
+    var ctx_bulk = ApplyContext.init(&gauge_tree.tree);
+    ctx_bulk.field_in = &psi_arena;
+    ctx_bulk.field_out = &out_bulk;
+    ctx_bulk.field_ghosts = &ghosts;
 
     for (gauge_tree.tree.blocks.items, 0..) |*block, idx| {
         if (block.block_index == std.math.maxInt(usize)) continue;
         const slot = gauge_tree.tree.getFieldSlot(idx);
         if (slot == std.math.maxInt(usize)) continue;
 
-        H.executeInterior(idx, block, &psi_arena, &out_bulk, &ghosts, null);
-        H.executeBoundary(idx, block, &psi_arena, &out_bulk, &ghosts, null);
+        H.execute(idx, block, &ctx_bulk);
     }
+
+    // Pipeline path: use apply() convenience wrapper
     try H.apply(&psi_arena, &out_pipe, &ghosts, null);
 
     for (gauge_tree.tree.blocks.items, 0..) |*block, idx| {

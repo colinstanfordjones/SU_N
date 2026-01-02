@@ -550,14 +550,15 @@ pub fn AMRTree(comptime Frontend: type) type {
                 field_ghost_slice = ctx.field_ghosts.?.slice(self.blocks.items.len);
             }
 
-            var dist_state: ?FieldExchange.ExchangeState = null;
             if (needs_field_ghosts) {
                 const exchange_ctx = FieldPolicy.Context{
                     .tree = self,
                     .arena = field_arena.?,
                     .ghosts = field_ghost_slice,
                 };
-                dist_state = try self.field_exchange.begin(exchange_ctx, self.shard_context);
+                var dist_state = try self.field_exchange.begin(exchange_ctx, self.shard_context);
+                try self.field_exchange.finish(exchange_ctx, &dist_state);
+                ctx.field_ghosts_dirty = false;
             }
 
             // Define execution context for task scheduling
@@ -573,7 +574,7 @@ pub fn AMRTree(comptime Frontend: type) type {
                 }
             };
 
-            // Execute interior computation (can overlap with ghost exchange)
+            // Execute computation (ghosts are ready if requested)
             self.interior_group.reset();
 
             for (self.blocks.items, 0..) |*block, idx| {
@@ -598,21 +599,9 @@ pub fn AMRTree(comptime Frontend: type) type {
                 self.interior_group.submit(&self.pool, .{ .run = ExecCtx.run, .ctx = exec_ctx });
             }
 
-            // Finish field ghost exchange
-            if (dist_state) |*state| {
-                const exchange_ctx = FieldPolicy.Context{
-                    .tree = self,
-                    .arena = field_arena.?,
-                    .ghosts = field_ghost_slice,
-                };
-                try self.field_exchange.finish(exchange_ctx, state);
-            }
-
-            // Mark ghosts as clean
-            ctx.field_ghosts_dirty = false;
-
             // Wait for all computation to complete
             self.interior_group.wait();
+            ctx.field_ghosts_dirty = false;
         }
 
         pub fn blockCount(self: *const Self) usize {

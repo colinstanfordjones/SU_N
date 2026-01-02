@@ -98,20 +98,25 @@ const block_size = 16;
 const N_gauge = 1;
 const HAMR = HamiltonianDiracAMR(N_gauge, block_size, TestTopology4D);
 const N_field = HAMR.field_dim;
-const GT = HAMR.GaugeTreeType;
+const Tree = HAMR.TreeType;
+const GaugeField = HAMR.GaugeFieldType;
 const Arena = HAMR.FieldArena;
 const Ghosts = HAMR.GhostBufferType;
 
 fn setupAMR(allocator: std.mem.Allocator) !struct {
-    tree: *GT,
+    tree: *Tree,
+    field: *GaugeField,
     psi: *Arena,
     workspace: *Arena,
     ghosts: *Ghosts,
     h: HAMR,
 } {
-    var tree_ptr = try allocator.create(GT);
-    tree_ptr.* = try GT.init(allocator, 1.0, 2, 8);
+    var tree_ptr = try allocator.create(Tree);
+    tree_ptr.* = try Tree.init(allocator, 1.0, 2, 8);
+    var field_ptr = try allocator.create(GaugeField);
+    field_ptr.* = try GaugeField.init(allocator, tree_ptr);
     const block_idx = try tree_ptr.insertBlock(.{ 0, 0, 0, 0 }, 0);
+    try field_ptr.syncWithTree(tree_ptr);
 
     var psi_ptr = try allocator.create(Arena);
     psi_ptr.* = try Arena.init(allocator, 1);
@@ -119,14 +124,14 @@ fn setupAMR(allocator: std.mem.Allocator) !struct {
     workspace_ptr.* = try Arena.init(allocator, 1);
 
     const slot = psi_ptr.allocSlot() orelse return error.OutOfMemory;
-    tree_ptr.tree.assignFieldSlot(block_idx, slot);
+    tree_ptr.assignFieldSlot(block_idx, slot);
     _ = workspace_ptr.allocSlot() orelse return error.OutOfMemory;
 
     const ghosts_ptr = try allocator.create(Ghosts);
     ghosts_ptr.* = try Ghosts.init(allocator, 1);
 
-    const h = HAMR.init(tree_ptr, 1.0, 1.0, .none);
-    return .{ .tree = tree_ptr, .psi = psi_ptr, .workspace = workspace_ptr, .ghosts = ghosts_ptr, .h = h };
+    const h = HAMR.init(tree_ptr, field_ptr, 1.0, 1.0, .none);
+    return .{ .tree = tree_ptr, .field = field_ptr, .psi = psi_ptr, .workspace = workspace_ptr, .ghosts = ghosts_ptr, .h = h };
 }
 
 fn benchDiracApply1Block() void {
@@ -134,10 +139,12 @@ fn benchDiracApply1Block() void {
     var setup = setupAMR(allocator) catch @panic("Setup failed");
     defer {
         setup.h.deinit();
+        setup.field.deinit();
         setup.tree.deinit();
         setup.psi.deinit();
         setup.workspace.deinit();
         setup.ghosts.deinit();
+        allocator.destroy(setup.field);
         allocator.destroy(setup.tree);
         allocator.destroy(setup.psi);
         allocator.destroy(setup.workspace);
@@ -153,10 +160,12 @@ fn benchMeasureEnergy1Block() void {
     var setup = setupAMR(allocator) catch @panic("Setup failed");
     defer {
         setup.h.deinit();
+        setup.field.deinit();
         setup.tree.deinit();
         setup.psi.deinit();
         setup.workspace.deinit();
         setup.ghosts.deinit();
+        allocator.destroy(setup.field);
         allocator.destroy(setup.tree);
         allocator.destroy(setup.psi);
         allocator.destroy(setup.workspace);
@@ -174,10 +183,12 @@ fn benchNormalize1Block() void {
     var setup = setupAMR(allocator) catch @panic("Setup failed");
     defer {
         setup.h.deinit();
+        setup.field.deinit();
         setup.tree.deinit();
         setup.psi.deinit();
         setup.workspace.deinit();
         setup.ghosts.deinit();
+        allocator.destroy(setup.field);
         allocator.destroy(setup.tree);
         allocator.destroy(setup.psi);
         allocator.destroy(setup.workspace);
@@ -198,11 +209,13 @@ const HMCTopology4D = amr.topology.PeriodicTopology(4, .{ 8.0, 8.0, 8.0, 8.0 });
 // Use GaugeFrontend for HMC benchmarks: U(1), scalar, 4D, 4^4 block
 const HMCFrontend = gauge.GaugeFrontend(N_gauge, 1, 4, 4, HMCTopology4D);
 const Force = AMRForce(HMCFrontend);
-const HMCTree = Force.GaugeTreeType;
+const HMCTree = Force.TreeType;
+const HMCField = Force.GaugeFieldType;
 
 /// HMC benchmark state - pre-allocated to avoid timing allocation overhead.
 const HMCBenchState = struct {
     tree: *HMCTree,
+    field: *HMCField,
     forces: *Force.AlgebraBuffer,
     momenta: *Force.AlgebraBuffer,
     prng: std.Random.DefaultPrng,
@@ -211,6 +224,8 @@ const HMCBenchState = struct {
     fn init(allocator: std.mem.Allocator) !HMCBenchState {
         var tree_ptr = try allocator.create(HMCTree);
         tree_ptr.* = try HMCTree.init(allocator, 1.0, 2, 8);
+        var field_ptr = try allocator.create(HMCField);
+        field_ptr.* = try HMCField.init(allocator, tree_ptr);
         // Insert 2x2x2 = 8 blocks for a more realistic benchmark
         for (0..2) |x| {
             for (0..2) |y| {
@@ -220,7 +235,8 @@ const HMCBenchState = struct {
             }
         }
 
-        const n_blocks = tree_ptr.tree.blocks.items.len;
+        try field_ptr.syncWithTree(tree_ptr);
+        const n_blocks = tree_ptr.blocks.items.len;
 
         // Allocate force buffer (AlgebraBuffer)
         var forces = try allocator.create(Force.AlgebraBuffer);
@@ -234,6 +250,7 @@ const HMCBenchState = struct {
 
         return .{
             .tree = tree_ptr,
+            .field = field_ptr,
             .forces = forces,
             .momenta = momenta,
             .prng = std.Random.DefaultPrng.init(42),
@@ -246,6 +263,8 @@ const HMCBenchState = struct {
         self.allocator.destroy(self.forces);
         self.momenta.deinit();
         self.allocator.destroy(self.momenta);
+        self.field.deinit();
+        self.allocator.destroy(self.field);
         self.tree.deinit();
         self.allocator.destroy(self.tree);
     }
@@ -272,7 +291,7 @@ fn benchComputeTreeForces() void {
     state.reset();
 
     const beta: f64 = 6.0;
-    const count = Force.computeTreeForces(state.tree, state.forces, beta) catch @panic("force compute failed");
+    const count = Force.computeTreeForces(state.tree, state.field, state.forces, beta) catch @panic("force compute failed");
     std.mem.doNotOptimizeAway(count);
 }
 
@@ -284,7 +303,7 @@ fn benchLeapfrogStep() void {
     const dt: f64 = 0.01;
 
     // Single leapfrog step (momenta already initialized by reset)
-    const count = Force.leapfrogIntegrate(state.tree, state.momenta, state.forces, dt, 1, beta) catch @panic("leapfrog failed");
+    const count = Force.leapfrogIntegrate(state.tree, state.field, state.momenta, state.forces, dt, 1, beta) catch @panic("leapfrog failed");
     std.mem.doNotOptimizeAway(count);
 }
 
@@ -297,7 +316,7 @@ fn benchLeapfrogTrajectory() void {
     const n_steps: usize = 10;
 
     // Full trajectory (momenta already initialized by reset)
-    const count = Force.leapfrogIntegrate(state.tree, state.momenta, state.forces, dt, n_steps, beta) catch @panic("leapfrog failed");
+    const count = Force.leapfrogIntegrate(state.tree, state.field, state.momenta, state.forces, dt, n_steps, beta) catch @panic("leapfrog failed");
     std.mem.doNotOptimizeAway(count);
 }
 
@@ -336,8 +355,10 @@ fn runHydrogenGroundStateAMR(max_steps: usize) HydrogenResult {
     const spacing = 20.0;
     const grid_dim = 2;
     
-    var tree_ptr = allocator.create(GT) catch @panic("OOM");
-    tree_ptr.* = GT.init(allocator, spacing, 2, 8) catch @panic("OOM");
+    var tree_ptr = allocator.create(Tree) catch @panic("OOM");
+    tree_ptr.* = Tree.init(allocator, spacing, 2, 8) catch @panic("OOM");
+    var field_ptr = allocator.create(GaugeField) catch @panic("OOM");
+    field_ptr.* = GaugeField.init(allocator, tree_ptr) catch @panic("OOM");
 
     var psi_ptr = allocator.create(Arena) catch @panic("OOM");
     psi_ptr.* = Arena.init(allocator, 32) catch @panic("OOM");
@@ -362,20 +383,22 @@ fn runHydrogenGroundStateAMR(max_steps: usize) HydrogenResult {
                 const slot = psi_ptr.allocSlot() orelse @panic("OOM");
                 _ = workspace_ptr.allocSlot() orelse @panic("OOM");
                 _ = workspace2_ptr.allocSlot() orelse @panic("OOM");
-                tree_ptr.tree.assignFieldSlot(idx, slot);
+                tree_ptr.assignFieldSlot(idx, slot);
             }
         }
     }
+    field_ptr.syncWithTree(tree_ptr) catch @panic("OOM");
     
     defer {
         psi_ptr.deinit(); allocator.destroy(psi_ptr);
         workspace_ptr.deinit(); allocator.destroy(workspace_ptr);
         workspace2_ptr.deinit(); allocator.destroy(workspace2_ptr);
         ghosts_ptr.deinit(); allocator.destroy(ghosts_ptr);
+        field_ptr.deinit(); allocator.destroy(field_ptr);
         tree_ptr.deinit(); allocator.destroy(tree_ptr);
     }
 
-    var h = HAMR.init(tree_ptr, 1.0, 1.0, .coulomb);
+    var h = HAMR.init(tree_ptr, field_ptr, 1.0, 1.0, .coulomb);
     defer h.deinit();
     
     const center_pos = @as(f64, @floatFromInt(block_size * grid_dim)) * spacing / 2.0;
@@ -384,9 +407,9 @@ fn runHydrogenGroundStateAMR(max_steps: usize) HydrogenResult {
     const alpha_val = HyperfineConstants.alpha;
     
     for (blocks.items) |b_idx| {
-        const slot = tree_ptr.tree.getFieldSlot(b_idx);
+        const slot = tree_ptr.getFieldSlot(b_idx);
         const psi_data = psi_ptr.getSlot(slot);
-        const block = &tree_ptr.tree.blocks.items[b_idx];
+        const block = &tree_ptr.blocks.items[b_idx];
         
         for (0..HAMR.block_volume) |i| {
             const pos = block.getPhysicalPosition(i);
@@ -414,7 +437,7 @@ fn runHydrogenGroundStateAMR(max_steps: usize) HydrogenResult {
 
     var max_sq: f64 = 0.0;
     for (blocks.items) |b_idx| {
-        const slot = tree_ptr.tree.getFieldSlot(b_idx);
+        const slot = tree_ptr.getFieldSlot(b_idx);
         const psi_data = psi_ptr.getSlotConst(slot);
         for (0..HAMR.block_volume) |i| {
             var val_sq: f64 = 0;

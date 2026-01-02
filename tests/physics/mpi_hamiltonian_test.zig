@@ -25,8 +25,9 @@ test "mpi hamiltonian energy is deterministic" {
     const block_size = 4;
     const Topology = amr.topology.OpenTopology(2, .{ 8.0, 8.0 });
     const Frontend = gauge.GaugeFrontend(1, 1, 2, block_size, Topology);
-    const GT = gauge.GaugeTree(Frontend);
-    const Arena = GT.FieldArena;
+    const Tree = amr.AMRTree(Frontend);
+    const GaugeField = gauge.GaugeField(Frontend);
+    const Arena = amr.FieldArena(Frontend);
     const GhostBuffer = amr.GhostBuffer(Frontend);
     const HAMR = physics.hamiltonian_amr.HamiltonianAMR(Frontend);
 
@@ -39,11 +40,14 @@ test "mpi hamiltonian energy is deterministic" {
     var ghosts = try GhostBuffer.init(std.testing.allocator, 4);
     defer ghosts.deinit();
 
-    var gauge_tree = try GT.init(std.testing.allocator, 1.0, 4, 8);
-    defer gauge_tree.deinit();
+    var tree = try Tree.init(std.testing.allocator, 1.0, 4, 8);
+    defer tree.deinit();
+    var field = try GaugeField.init(std.testing.allocator, &tree);
+    defer field.deinit();
 
-    const block_idx = try gauge_tree.insertBlockWithField(.{ 0, 0 }, 0, &psi);
-    const slot = gauge_tree.tree.getFieldSlot(block_idx);
+    const block_idx = try tree.insertBlockWithField(.{ 0, 0 }, 0, &psi);
+    try field.syncWithTree(&tree);
+    const slot = tree.getFieldSlot(block_idx);
     const work_slot = workspace.allocSlot() orelse return error.OutOfMemory;
     try std.testing.expectEqual(slot, work_slot);
 
@@ -52,7 +56,7 @@ test "mpi hamiltonian energy is deterministic" {
         v.*[0] = Complex.init(1.0, 0.0);
     }
 
-    var h = HAMR.init(&gauge_tree, 1.0, zeroPotential);
+    var h = HAMR.init(&tree, &field, 1.0, zeroPotential);
     const local_energy = try h.measureEnergy(&psi, &workspace, &ghosts);
     const total = try platform.mpi.allreduceSum(comm, local_energy);
 

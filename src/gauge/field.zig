@@ -26,8 +26,8 @@ const ghost_policy_mod = @import("ghost_policy.zig");
 
 pub fn GaugeField(comptime Frontend: type) type {
     const Tree = amr.AMRTree(Frontend);
-    const LinkArenaMod = edge_arena_mod.EdgeArena(Frontend);
-    const LinkGhostBuffer = edge_ghost_mod.EdgeGhostBuffer(Frontend);
+    const EdgeArena = edge_arena_mod.EdgeArena(Frontend);
+    const EdgeGhostBuffer = edge_ghost_mod.EdgeGhostBuffer(Frontend);
     const Link = Frontend.LinkType;
 
     return struct {
@@ -36,16 +36,16 @@ pub fn GaugeField(comptime Frontend: type) type {
         pub const FrontendType = Frontend;
         pub const TreeType = Tree;
         pub const LinkType = Link;
-        pub const LinkArena = LinkArenaMod;
-        pub const LinkGhostFaces = edge_ghost_mod.EdgeGhostBuffer(Frontend).EdgeGhostFaces;
+        pub const EdgeArenaType = EdgeArena;
+        pub const EdgeGhostFaces = EdgeGhostBuffer.EdgeGhostFaces;
 
         pub const Policy = ghost_policy_mod.LinkGhostPolicy(Self);
         pub const LinkExchange = dist_exchange_mod.DistExchange(Tree, Policy.Context, Policy.Payload);
 
         // Instance fields
         allocator: std.mem.Allocator,
-        arena: LinkArenaMod,
-        ghosts: LinkGhostBuffer,
+        arena: EdgeArena,
+        ghosts: EdgeGhostBuffer,
         link_exchange: LinkExchange,
         
         /// Mapping from tree block index to arena slot index.
@@ -61,8 +61,8 @@ pub fn GaugeField(comptime Frontend: type) type {
             const max_blocks = tree.blocks.items.len;
             
             // Initialize components
-            const arena = try LinkArenaMod.init(allocator, @max(16, max_blocks));
-            const ghosts = try LinkGhostBuffer.init(allocator, @max(16, max_blocks));
+            const arena = try EdgeArena.init(allocator, @max(16, max_blocks));
+            const ghosts = try EdgeGhostBuffer.init(allocator, @max(16, max_blocks));
             
             // Initialize slots
             const slots = try std.ArrayList(usize).initCapacity(allocator, max_blocks);
@@ -104,8 +104,8 @@ pub fn GaugeField(comptime Frontend: type) type {
                 const block = &tree.blocks.items[idx];
                 
                 if (block.block_index != std.math.maxInt(usize)) {
-                    const slot = self.arena.allocSlot() orelse return error.LinkArenaFull;
-                    self.arena.initSlotToIdentity(slot);
+                    const slot = self.arena.allocSlot() orelse return error.EdgeArenaFull;
+                    self.arena.initSlotToDefault(slot);
                     self.slots.appendAssumeCapacity(slot);
                 } else {
                     self.slots.appendAssumeCapacity(std.math.maxInt(usize));
@@ -119,8 +119,8 @@ pub fn GaugeField(comptime Frontend: type) type {
                     // Check if we have a valid slot
                     if (self.slots.items[idx] != std.math.maxInt(usize)) {
                          if (self.ghosts.slots[idx] == null) {
-                            const ghost = try self.allocator.create(LinkGhostBuffer.LinkGhostFaces);
-                            ghost.* = LinkGhostBuffer.LinkGhostFaces.init(self.allocator);
+                            const ghost = try self.allocator.create(EdgeGhostBuffer.EdgeGhostFaces);
+                            ghost.* = EdgeGhostBuffer.EdgeGhostFaces.init(self.allocator);
                             try ghost.ensureInitialized();
                             self.ghosts.slots[idx] = ghost;
                         }
@@ -173,7 +173,7 @@ pub fn GaugeField(comptime Frontend: type) type {
 
             // Defragment arena: this moves data so slot[i] == i for active blocks
             // This is optional but good for locality.
-            // Wait, LinkArena.defragmentWithOrder expects `link_slots` to be mapped.
+            // Wait, EdgeArena.defragmentWithOrder expects `link_slots` to be mapped.
             // And it updates `link_slots` in place to be 0..N.
             // But `link_slots` (our self.slots) contains maxInt for holes.
             // `defragmentWithOrder` documentation says:
@@ -189,10 +189,10 @@ pub fn GaugeField(comptime Frontend: type) type {
             try self.arena.defragmentWithOrder(self.slots.items, active_count);
 
             // Reorder ghosts
-            // LinkGhostBuffer doesn't have a reorder method, we must do it manually.
+            // EdgeGhostBuffer doesn't have a reorder method, we must do it manually.
             // The `perm` applied to blocks.
             // We need to apply it to `self.ghosts.slots`.
-            const old_ghost_slots = try self.allocator.dupe(?*LinkGhostBuffer.LinkGhostFaces, self.ghosts.slots);
+            const old_ghost_slots = try self.allocator.dupe(?*EdgeGhostBuffer.EdgeGhostFaces, self.ghosts.slots);
             defer self.allocator.free(old_ghost_slots);
             
             // Resize ghost slots
@@ -222,7 +222,7 @@ pub fn GaugeField(comptime Frontend: type) type {
             if (block_idx >= self.slots.items.len) return Link.identity();
             const slot = self.slots.items[block_idx];
             if (slot == std.math.maxInt(usize)) return Link.identity();
-            return self.arena.getLink(slot, site, mu);
+            return self.arena.getEdge(slot, site, mu);
         }
 
         /// Set link for a specific block/site/direction
@@ -230,7 +230,7 @@ pub fn GaugeField(comptime Frontend: type) type {
             if (block_idx >= self.slots.items.len) return;
             const slot = self.slots.items[block_idx];
             if (slot == std.math.maxInt(usize)) return;
-            self.arena.setLink(slot, site, mu, link);
+            self.arena.setEdge(slot, site, mu, link);
         }
         
         /// Get slice of all links for a block
@@ -320,16 +320,16 @@ pub fn GaugeField(comptime Frontend: type) type {
             try writer.writeAll(links_magic);
             
             const num_blocks = self.slots.items.len;
-            const links_per_block = edge_arena_mod.EdgeArena(Frontend).num_links;
+            const edges_per_block = edge_arena_mod.EdgeArena(Frontend).num_edges;
 
             try writer.writeInt(u64, @as(u64, @intCast(num_blocks)), .little);
-            try writer.writeInt(u64, @as(u64, @intCast(links_per_block)), .little);
+            try writer.writeInt(u64, @as(u64, @intCast(edges_per_block)), .little);
 
             // Write links for all blocks to maintain 1-to-1 mapping with tree.blocks
             // For invalid blocks (slot == maxInt), write zeros/identity.
             
             // We need a scratch buffer for identity links
-            const identity_scratch = try self.allocator.alloc(Link, links_per_block);
+            const identity_scratch = try self.allocator.alloc(Link, edges_per_block);
             defer self.allocator.free(identity_scratch);
             for (identity_scratch) |*l| l.* = Link.identity();
             const identity_bytes = std.mem.sliceAsBytes(identity_scratch);
@@ -337,7 +337,7 @@ pub fn GaugeField(comptime Frontend: type) type {
             for (self.slots.items) |slot| {
                 if (slot != std.math.maxInt(usize)) {
                     const slice = self.arena.getSlotConst(slot);
-                    if (slice.len != links_per_block) return error.InvalidLinkLayout;
+                    if (slice.len != edges_per_block) return error.InvalidLinkLayout;
                     try writer.writeAll(std.mem.sliceAsBytes(slice));
                 } else {
                     try writer.writeAll(identity_bytes);
@@ -358,7 +358,7 @@ pub fn GaugeField(comptime Frontend: type) type {
             // Validate against tree
             if (num_blocks != tree.blocks.items.len) return error.IncompatibleCheckpoint;
             
-            const expected_links_len = edge_arena_mod.EdgeArena(Frontend).num_links;
+            const expected_links_len = edge_arena_mod.EdgeArena(Frontend).num_edges;
             if (stored_links_len != expected_links_len) return error.IncompatibleCheckpoint;
 
             // Initialize self

@@ -1,7 +1,7 @@
 //! AMR Force Module for Gauge Dynamics
 //!
 //! Implements force calculation for Hybrid Monte Carlo (HMC) on AMR grids.
-//! Uses GaugeTree from the gauge module for all link and ghost operations.
+//! Uses AMRTree + GaugeField for all link and ghost operations.
 //!
 //! ## Usage
 //!
@@ -10,16 +10,19 @@
 //! const physics = @import("physics");
 //!
 //! const Frontend = gauge.GaugeFrontend(3, 1, 4, 16);  // SU(3), scalar, 4D, 16^4
-//! const GT = gauge.GaugeTree(Frontend);
+//! const Tree = amr.AMRTree(Frontend);
+//! const GaugeField = gauge.GaugeField(Frontend);
 //! const Force = physics.force_amr.AMRForce(Frontend);
 //!
-//! var tree = try GT.init(allocator, 1.0, 4);
+//! var tree = try Tree.init(allocator, 1.0, 4);
 //! defer tree.deinit();
+//! var field = try GaugeField.init(allocator, &tree);
+//! defer field.deinit();
 //!
 //! var forces = try Force.AlgebraBuffer.init(allocator, 64);
 //! defer forces.deinit();
 //!
-//! Force.computeTreeForces(&tree, &forces, beta);
+//! Force.computeTreeForces(&tree, &field, &forces, beta);
 //! ```
 //!
 //! ## The Hanging Node Problem
@@ -69,8 +72,10 @@ pub fn AMRForce(comptime Frontend: type) type {
         if (Nd != 4) @compileError("AMRForce requires exactly 4 dimensions");
     }
 
-    const GaugeTree = gauge.GaugeTree(Frontend);
-    const Block = GaugeTree.BlockType;
+    const Tree = amr.AMRTree(Frontend);
+    const GaugeField = gauge.GaugeField(Frontend);
+    const LinkOps = Frontend.LinkOperators;
+    const Block = Tree.BlockType;
     const Matrix = math.Matrix(Complex, N_gauge, N_gauge);
 
     return struct {
@@ -78,7 +83,8 @@ pub fn AMRForce(comptime Frontend: type) type {
 
         pub const FrontendType = Frontend;
         pub const LinkType = Link;
-        pub const GaugeTreeType = GaugeTree;
+        pub const TreeType = Tree;
+        pub const GaugeFieldType = GaugeField;
         pub const MatrixType = Matrix;
 
         /// Number of links per block
@@ -272,16 +278,17 @@ pub fn AMRForce(comptime Frontend: type) type {
         // Force Computation
         // =====================================================================
 
-        /// Compute force on a single link using staple from GaugeTree.
+        /// Compute force on a single link using the gauge staple.
         pub fn computeLocalForce(
-            tree: *const GaugeTree,
+            tree: *const Tree,
+            field: *const GaugeField,
             block_idx: usize,
             site_idx: usize,
             comptime mu: usize,
             beta: f64,
         ) Force {
-            const u = tree.getLink(block_idx, site_idx, mu);
-            const staple = tree.computeStaple(block_idx, site_idx, mu);
+            const u = field.getLink(block_idx, site_idx, mu);
+            const staple = LinkOps.computeStaple(tree, field, block_idx, site_idx, mu);
             const u_staple = u.mul(staple);
             const force = projectToAlgebra(u_staple.matrix);
             return force.scale(-beta / @as(f64, N_gauge));
@@ -289,7 +296,8 @@ pub fn AMRForce(comptime Frontend: type) type {
 
         /// Compute force with runtime mu parameter
         fn computeLocalForceRuntime(
-            tree: *const GaugeTree,
+            tree: *const Tree,
+            field: *const GaugeField,
             block_idx: usize,
             site_idx: usize,
             mu: usize,
@@ -298,7 +306,7 @@ pub fn AMRForce(comptime Frontend: type) type {
             var result = Force.zero();
             inline for (0..Nd) |mu_idx| {
                 if (mu == mu_idx) {
-                    result = computeLocalForce(tree, block_idx, site_idx, mu_idx, beta);
+                    result = computeLocalForce(tree, field, block_idx, site_idx, mu_idx, beta);
                 }
             }
             return result;
@@ -306,7 +314,8 @@ pub fn AMRForce(comptime Frontend: type) type {
 
         /// Kernel for parallel force computation
         const ForceKernel = struct {
-            tree: *GaugeTree,
+            tree: *Tree,
+            field: *GaugeField,
             forces: *AlgebraBuffer,
             beta: f64,
 
@@ -324,7 +333,7 @@ pub fn AMRForce(comptime Frontend: type) type {
                     for (0..Nd) |mu| {
                         const force_idx = site * Nd + mu;
                         if (force_idx < force_slice.len) {
-                            force_slice[force_idx] = computeLocalForceRuntime(self.tree, block_idx, site, mu, self.beta);
+                            force_slice[force_idx] = computeLocalForceRuntime(self.tree, self.field, block_idx, site, mu, self.beta);
                         }
                     }
                 }
@@ -333,45 +342,48 @@ pub fn AMRForce(comptime Frontend: type) type {
 
         /// Compute forces on all links in the tree.
         pub fn computeTreeForces(
-            tree: *GaugeTree,
+            tree: *Tree,
+            field: *GaugeField,
             forces: *AlgebraBuffer,
             beta: f64,
         ) !usize {
             // Ensure force buffer has enough blocks
-            try forces.ensureBlocks(tree.tree.blocks.items.len);
+            try forces.ensureBlocks(tree.blocks.items.len);
 
-            var kernel = ForceKernel{ .tree = tree, .forces = forces, .beta = beta };
+            var kernel = ForceKernel{ .tree = tree, .field = field, .forces = forces, .beta = beta };
 
             // Build ApplyContext (no field data, just tree reference)
-            var ctx = amr.ApplyContext(Frontend).init(&tree.tree);
+            var ctx = amr.ApplyContext(Frontend).init(tree);
+            try field.fillGhosts(tree);
             try tree.apply(&kernel, &ctx);
 
             // Accumulate transmitted forces at refinement boundaries
-            accumulateTransmittedForces(tree, forces, beta);
+            accumulateTransmittedForces(tree, field, forces, beta);
 
             // Return count (approximate, since we don't sum in parallel easily)
             // Just return total links?
-            return tree.tree.blockCount() * links_per_block;
+            return tree.blockCount() * links_per_block;
         }
 
         fn accumulateTransmittedForces(
-            tree: *const GaugeTree,
+            tree: *const Tree,
+            field: *const GaugeField,
             forces: *AlgebraBuffer,
             beta: f64,
         ) void {
             const deriv_factor: f64 = 0.5; // Derivative of prolongation
 
-            for (tree.tree.blocks.items, 0..) |*fine_block, fine_idx| {
+            for (tree.blocks.items, 0..) |*fine_block, fine_idx| {
                 if (fine_block.block_index == std.math.maxInt(usize)) continue;
 
                 for (0..(2 * Nd)) |face| {
                     if ((face % 2) != 0) continue; // Only positive faces
 
-                    const neighbor_info = tree.tree.neighborInfo(fine_idx, face);
+                    const neighbor_info = tree.neighborInfo(fine_idx, face);
                     if (!neighbor_info.exists() or neighbor_info.level_diff >= 0) continue;
                     const neighbor_idx = neighbor_info.block_idx;
-                    if (neighbor_idx >= tree.tree.blocks.items.len) continue;
-                    const neighbor = &tree.tree.blocks.items[neighbor_idx];
+                    if (neighbor_idx >= tree.blocks.items.len) continue;
+                    const neighbor = &tree.blocks.items[neighbor_idx];
 
                     if (neighbor_idx >= forces.slices.items.len) continue;
                     const coarse_forces = forces.slices.items[neighbor_idx];
@@ -383,10 +395,10 @@ pub fn AMRForce(comptime Frontend: type) type {
                         const link_dim = getTangentialDim(face_dim, t_idx);
 
                         for (0..Block.ghost_face_size) |ghost_idx| {
-                            const ghost_link = tree.getGhostLink(fine_idx, face, link_dim, ghost_idx);
+                            const ghost_link = getGhostLink(field, fine_idx, face, link_dim, ghost_idx);
 
                             // Compute simplified ghost staple
-                            const ghost_staple = computeGhostStaple(tree, fine_idx, face, ghost_idx, link_dim);
+                            const ghost_staple = computeGhostStaple(field, fine_idx, face, ghost_idx, link_dim);
                             const u_staple = ghost_link.mul(ghost_staple);
                             const ghost_force = projectToAlgebra(u_staple.matrix).scale(-beta / @as(f64, N_gauge));
 
@@ -435,8 +447,21 @@ pub fn AMRForce(comptime Frontend: type) type {
             }
         }
 
+        fn getGhostLink(
+            field: *const GaugeField,
+            block_idx: usize,
+            face_idx: usize,
+            link_dim: usize,
+            ghost_idx: usize,
+        ) Link {
+            const ghost = field.ghosts.get(block_idx) orelse return Link.identity();
+            const slice = ghost.get(face_idx, link_dim);
+            if (ghost_idx < slice.len) return slice[ghost_idx];
+            return Link.identity();
+        }
+
         fn computeGhostStaple(
-            tree: *const GaugeTree,
+            field: *const GaugeField,
             block_idx: usize,
             face: usize,
             ghost_idx: usize,
@@ -466,9 +491,9 @@ pub fn AMRForce(comptime Frontend: type) type {
                 const boundary_site = Block.getLocalIndex(boundary_coords);
                 const shifted_site = Block.getLocalIndex(shifted_coords);
 
-                const u_mu_at_x = tree.getLink(block_idx, boundary_site, face_dim);
-                const u_t_at_x = tree.getLink(block_idx, boundary_site, link_dim);
-                const u_mu_at_shifted = tree.getLink(block_idx, shifted_site, face_dim);
+                const u_mu_at_x = field.getLink(block_idx, boundary_site, face_dim);
+                const u_t_at_x = field.getLink(block_idx, boundary_site, link_dim);
+                const u_mu_at_shifted = field.getLink(block_idx, shifted_site, face_dim);
 
                 staple = staple.add(u_mu_at_shifted.adjoint().mul(u_t_at_x.adjoint()).mul(u_mu_at_x));
             }
@@ -516,15 +541,16 @@ pub fn AMRForce(comptime Frontend: type) type {
         }
 
         pub fn updateLinks(
-            tree: *GaugeTree,
+            tree: *Tree,
+            field: *GaugeField,
             momenta: *const AlgebraBuffer,
             dt: f64,
         ) void {
-            for (tree.tree.blocks.items, 0..) |*block, idx| {
+            for (tree.blocks.items, 0..) |*block, idx| {
                 if (block.block_index == std.math.maxInt(usize)) continue;
                 if (idx >= momenta.slices.items.len) continue;
                 const mom_slice = momenta.slices.items[idx];
-                const links = tree.getBlockLinksMut(idx) orelse continue;
+                const links = field.getBlockLinksMut(idx) orelse continue;
 
                 for (0..Block.volume) |site| {
                     inline for (0..Nd) |mu| {
@@ -540,11 +566,12 @@ pub fn AMRForce(comptime Frontend: type) type {
                     }
                 }
             }
-            tree.ghosts_valid = false;
+            field.ghosts.invalidateAll();
         }
 
         pub fn leapfrogIntegrate(
-            tree: *GaugeTree,
+            tree: *Tree,
+            field: *GaugeField,
             momenta: *AlgebraBuffer,
             forces: *AlgebraBuffer,
             dt: f64,
@@ -554,14 +581,14 @@ pub fn AMRForce(comptime Frontend: type) type {
             var total_force_count: usize = 0;
 
             forces.setZero();
-            total_force_count += try computeTreeForces(tree, forces, beta);
+            total_force_count += try computeTreeForces(tree, field, forces, beta);
 
             for (0..n_steps) |_| {
                 updateMomentumHalfStep(momenta, forces, dt);
-                updateLinks(tree, momenta, dt);
+                updateLinks(tree, field, momenta, dt);
 
                 forces.setZero();
-                total_force_count += try computeTreeForces(tree, forces, beta);
+                total_force_count += try computeTreeForces(tree, field, forces, beta);
                 updateMomentumHalfStep(momenta, forces, dt);
             }
 
@@ -569,13 +596,14 @@ pub fn AMRForce(comptime Frontend: type) type {
         }
 
         pub fn computeHamiltonian(
-            tree: *GaugeTree,
+            tree: *Tree,
+            field: *GaugeField,
             momenta: *const AlgebraBuffer,
             beta: f64,
         ) !f64 {
-            try tree.fillGhosts();
+            try field.fillGhosts(tree);
             const kinetic = momenta.kineticEnergy();
-            const potential = tree.wilsonAction(beta);
+            const potential = LinkOps.wilsonAction(tree, field, beta);
             return kinetic + potential;
         }
 
@@ -600,7 +628,8 @@ pub fn AMRForce(comptime Frontend: type) type {
         }
 
         pub fn hmcStep(
-            tree: *GaugeTree,
+            tree: *Tree,
+            field: *GaugeField,
             momenta: *AlgebraBuffer,
             forces: *AlgebraBuffer,
             dt: f64,
@@ -609,23 +638,23 @@ pub fn AMRForce(comptime Frontend: type) type {
             rng: std.Random,
         ) !HMCResult {
             // Save link configuration
-            const backup = try tree.saveLinks(tree.allocator);
-            defer GaugeTree.freeBackup(tree.allocator, backup);
+            const backup = try field.saveLinks(tree.allocator);
+            defer GaugeField.freeBackup(tree.allocator, backup);
 
             // Sample fresh momenta
             momenta.sampleGaussian(rng);
 
-            const H_initial = try computeHamiltonian(tree, momenta, beta);
+            const H_initial = try computeHamiltonian(tree, field, momenta, beta);
 
-            _ = try leapfrogIntegrate(tree, momenta, forces, dt, n_steps, beta);
+            _ = try leapfrogIntegrate(tree, field, momenta, forces, dt, n_steps, beta);
 
-            const H_final = try computeHamiltonian(tree, momenta, beta);
+            const H_final = try computeHamiltonian(tree, field, momenta, beta);
             const delta_H = H_final - H_initial;
 
             const accepted = metropolisAccept(delta_H, rng);
 
             if (!accepted) {
-                tree.restoreLinks(backup);
+                field.restoreLinks(backup);
             }
 
             return .{
@@ -754,23 +783,24 @@ pub fn AMRForce(comptime Frontend: type) type {
         // =====================================================================
 
         pub fn gradientCheck(
-            tree: *GaugeTree,
+            tree: *Tree,
+            field: *GaugeField,
             block_idx: usize,
             site_idx: usize,
             comptime mu: usize,
             beta: f64,
             epsilon: f64,
         ) !f64 {
-            try tree.fillGhosts();
+            try field.fillGhosts(tree);
 
-            const analytic = computeLocalForce(tree, block_idx, site_idx, mu, beta);
+            const analytic = computeLocalForce(tree, field, block_idx, site_idx, mu, beta);
             const analytic_norm = analytic.norm();
 
             if (analytic_norm < 1e-15) {
                 return 0.0;
             }
 
-            const original = tree.getLink(block_idx, site_idx, mu);
+            const original = field.getLink(block_idx, site_idx, mu);
 
             var numerical = Force.zero();
 
@@ -787,9 +817,9 @@ pub fn AMRForce(comptime Frontend: type) type {
                     }
 
                     const exp_plus = expAlgebra(perturb);
-                    tree.setLink(block_idx, site_idx, mu, original.mul(exp_plus));
-                    try tree.fillGhosts();
-                    const action_plus = tree.wilsonAction(beta);
+                    field.setLink(block_idx, site_idx, mu, original.mul(exp_plus));
+                    try field.fillGhosts(tree);
+                    const action_plus = LinkOps.wilsonAction(tree, field, beta);
 
                     var neg_perturb = Matrix.zero();
                     for (0..N_gauge) |i| {
@@ -798,9 +828,9 @@ pub fn AMRForce(comptime Frontend: type) type {
                         }
                     }
                     const exp_minus = expAlgebra(neg_perturb);
-                    tree.setLink(block_idx, site_idx, mu, original.mul(exp_minus));
-                    try tree.fillGhosts();
-                    const action_minus = tree.wilsonAction(beta);
+                    field.setLink(block_idx, site_idx, mu, original.mul(exp_minus));
+                    try field.fillGhosts(tree);
+                    const action_minus = LinkOps.wilsonAction(tree, field, beta);
 
                     const deriv = (action_plus - action_minus) / (2.0 * epsilon);
 
@@ -813,8 +843,8 @@ pub fn AMRForce(comptime Frontend: type) type {
                 }
             }
 
-            tree.setLink(block_idx, site_idx, mu, original);
-            tree.ghosts_valid = false;
+            field.setLink(block_idx, site_idx, mu, original);
+            field.ghosts.invalidateAll();
 
             const diff = analytic.sub(numerical);
             return diff.norm() / analytic_norm;
@@ -870,19 +900,23 @@ test "AMRForce - momentum sampling" {
 test "AMRForce - compute forces on single block" {
     const Frontend = gauge.frontend.GaugeFrontend(1, 1, 4, 4, TestTopology4D);
     const ForceModule = AMRForce(Frontend);
-    const GT = gauge.GaugeTree(Frontend);
+    const Tree = amr.AMRTree(Frontend);
+    const GaugeField = gauge.GaugeField(Frontend);
 
     const allocator = std.testing.allocator;
 
-    var tree = try GT.init(allocator, 1.0, 4);
+    var tree = try Tree.init(allocator, 1.0, 4);
     defer tree.deinit();
+    var field = try GaugeField.init(allocator, &tree);
+    defer field.deinit();
 
     _ = try tree.insertBlock(.{ 0, 0, 0, 0 }, 0);
+    try field.syncWithTree(&tree);
 
     var forces = ForceModule.AlgebraBuffer.init(allocator, 4);
     defer forces.deinit();
 
-    const count = try ForceModule.computeTreeForces(&tree, &forces, 1.0);
+    const count = try ForceModule.computeTreeForces(&tree, &field, &forces, 1.0);
     try std.testing.expect(count > 0);
 
     // For identity links, forces should be zero (derivative of action at minimum)
@@ -893,14 +927,18 @@ test "AMRForce - compute forces on single block" {
 test "AMRForce - HMC step accepts identity" {
     const Frontend = gauge.frontend.GaugeFrontend(1, 1, 4, 4, TestTopology4D);
     const ForceModule = AMRForce(Frontend);
-    const GT = gauge.GaugeTree(Frontend);
+    const Tree = amr.AMRTree(Frontend);
+    const GaugeField = gauge.GaugeField(Frontend);
 
     const allocator = std.testing.allocator;
 
-    var tree = try GT.init(allocator, 1.0, 4);
+    var tree = try Tree.init(allocator, 1.0, 4);
     defer tree.deinit();
+    var field = try GaugeField.init(allocator, &tree);
+    defer field.deinit();
 
     _ = try tree.insertBlock(.{ 0, 0, 0, 0 }, 0);
+    try field.syncWithTree(&tree);
 
     var momenta = ForceModule.AlgebraBuffer.init(allocator, 4);
     defer momenta.deinit();
@@ -910,7 +948,7 @@ test "AMRForce - HMC step accepts identity" {
     defer forces.deinit();
 
     var prng = std.Random.DefaultPrng.init(42);
-    const result = try ForceModule.hmcStep(&tree, &momenta, &forces, 0.01, 5, 1.0, prng.random());
+    const result = try ForceModule.hmcStep(&tree, &field, &momenta, &forces, 0.01, 5, 1.0, prng.random());
 
     // delta_H should be small for small step size
     try std.testing.expect(@abs(result.delta_H) < 1.0);

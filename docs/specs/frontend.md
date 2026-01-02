@@ -360,7 +360,7 @@ The Frontend-based design keeps the AMR module domain-agnostic:
 | Module | Contains |
 |--------|----------|
 | `amr` | Generic AMR infrastructure (tree, block, field_arena, ghost_buffer, operators) |
-| `gauge` | `GaugeFrontend`, `LinkOperators`, `GaugeTree` |
+| `gauge` | `GaugeFrontend`, `LinkOperators`, `GaugeField` |
 | `physics` | `hamiltonian_amr`, `hamiltonian_dirac_amr`, `force_amr` |
 
 ## Related Specifications

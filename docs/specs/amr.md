@@ -9,11 +9,11 @@ The AMR module (`/src/amr/`) implements block-structured adaptive mesh refinemen
 - **Frontend-parameterized design**: All AMR types take a `Frontend` type that defines dimensionality, block size, and field type
 - **Linear octree organization**: Blocks indexed by Morton keys with a flat block list
 - **Morton indexing**: `reorder()` sorts blocks by Morton index for cache-optimal memory access
-- **Gauge-agnostic blocks**: Blocks store metadata only; gauge links are Frontend-owned
+- **Gauge-agnostic blocks**: Blocks store metadata only; gauge links live in `GaugeField` (edge storage)
 - **Namespace-style API**: Ghost filling and adaptation use pure functions (Zig 0.15 compatible)
 - **Push Model**: Two-phase ghost communication (pull + push) for refinement boundaries
 - **Threaded apply pipeline**: `AMRTree.apply` owns a persistent work-stealing pool and overlaps interior compute with ghost exchange.
-- **Kernel Pattern**: State (fields, mesh) is owned by AMR; physics logic is provided as a kernel to `AMRTree.apply`, using `executeInterior`/`executeBoundary` and optional ghost hooks.
+- **Kernel Pattern**: State (fields, mesh) is owned by AMR; physics logic is provided as a kernel to `AMRTree.apply`, using `execute(block_idx, block, ctx)` with an `ApplyContext`.
 - **Checkpoint/Restart**: `platform.checkpoint` snapshots AMR tree/arena (+ optional gauge links) for exact restarts; MPI shard metadata is rebuilt on load.
 
 See also: `docs/specs/amr/apply.md`, `docs/specs/amr/ghost_exchange.md`, `docs/specs/amr/examples.md`, `docs/specs/amr/mpi.md`, `docs/specs/amr/linear_octree.md`, `docs/specs/amr/checkpoint.md`, and `docs/specs/amr/multigrid_flux_register.md`.
@@ -30,17 +30,18 @@ src/amr/                    # Domain-agnostic AMR infrastructure
 ├── ghost_buffer.zig        # Ghost face storage for fields
 ├── tree.zig                # 2^Nd-tree structure and block management
 ├── block.zig               # Fixed-size gauge-agnostic blocks
-├── ghost.zig               # Ghost layer filling
+├── ghost.zig               # Legacy/local ghost helpers (push model)
 ├── adaptation.zig          # Mesh adaptation
 └── operators.zig           # Prolongation and restriction for generic FieldType
 
 src/gauge/                  # Gauge-specific AMR extensions
 ├── frontend.zig            # GaugeFrontend for AMR gauge fields
 ├── operators.zig           # LinkOperators for gauge link prolongation/restriction
-└── tree.zig                # GaugeTree - AMR tree with encapsulated link storage
+├── field.zig               # GaugeField - link storage + ghost buffers for AMRTree
+└── repartition.zig         # MPI repartition helpers for GaugeField
 
 src/physics/                # Physics modules using AMR
-└── force_amr.zig           # HMC force calculation using GaugeTree
+└── force_amr.zig           # HMC force calculation using GaugeField + AMRTree
 ```
 
 ## Frontend Interface
@@ -247,7 +248,7 @@ var ghosts = try Ghosts.init(allocator, max_blocks);
 defer ghosts.deinit();
 
 try ghosts.ensureForTree(&tree);
-amr.ghost.fillGhostLayers(Tree, &tree, &field_arena, ghosts.slice(tree.blocks.items.len));
+try tree.fillGhostLayers(&field_arena, ghosts.slice(tree.blocks.items.len));
 
 // Type alias for direct ghost face access
 const faces: *Ghosts.GhostFaces = ghosts.get(block_idx).?;
@@ -336,7 +337,7 @@ const NeighborInfo = struct {
 | `insertBlockWithField` | `(*Self, [Nd]usize, u8, *FieldArena) !usize` | Insert with field slot |
 | `refineBlock` | `(*Self, usize) !void` | Split into 2^Nd children |
 | `blockIterator` | `(*const Self) BlockIterator` | Iterate all blocks |
-| `apply` | `(*Self, kernel, inputs, outputs, ghosts) !void` | Threaded kernel execution with pipelined ghost exchange |
+| `apply` | `(*Self, kernel, *ApplyContext) !void` | Threaded kernel execution with field ghost exchange |
 | `blockCount` | `(*const Self) usize` | Number of blocks |
 | `getBlock` | `(*Self, usize) ?*Block` | Get block by index |
 | `getPhysicalOrigin` | `(*const Self, *Block) [Nd]f64` | Block physical coordinates |
@@ -355,81 +356,61 @@ const NeighborInfo = struct {
 
 ## Threaded Apply (AMRTree.apply)
 
-`AMRTree.apply` runs kernels on the AMR mesh with a pipelined, threaded schedule:
+`AMRTree.apply` runs kernels on the AMR mesh using an `ApplyContext`:
 
-1. Ghost pull (field ghosts, plus optional kernel ghost hooks)
-2. Interior compute (overlaps with ghost pull)
-3. Ghost push (field ghosts, plus optional kernel ghost hooks)
-4. Boundary compute (after ghosts are complete)
+1. Ensure field ghost buffers are sized for the current tree.
+2. Exchange field ghosts when `ctx.field_in` and `ctx.field_ghosts` are set.
+3. Execute `kernel.execute` across all blocks on the work-stealing pool.
+
+Edge-centered data can be passed through `ApplyContext`, but edge/link ghost exchange is explicit (e.g., `GaugeField.fillGhosts`).
 
 The tree owns a persistent work-stealing pool; task metadata is allocated from a per-group arena to avoid churn.
 
 **Kernel requirements:**
-- `executeInterior(self, block_idx, block, inputs, outputs, ghosts)`
-- `executeBoundary(self, block_idx, block, inputs, outputs, ghosts)`
-
-**Optional ghost hooks (all-or-none):**
-- `ghostPrepare(self) !bool` (return true if extra exchange needed)
-- `ghostPull(self, block_idx)`
-- `ghostPush(self, block_idx)`
-- `ghostFinalize(self)`
+- `execute(self, block_idx, block, ctx)`
 
 **Example:**
 ```zig
 const Tree = amr.AMRTree(Frontend);
 const Arena = amr.FieldArena(Frontend);
 const Ghosts = amr.GhostBuffer(Frontend);
+const ApplyContext = amr.ApplyContext(Frontend);
 
 const Kernel = struct {
     tree: *const Tree,
 
-    pub fn executeInterior(
+    pub fn execute(
         self: *Kernel,
         block_idx: usize,
         block: *const Tree.BlockType,
-        inputs: *Arena,
-        outputs: *Arena,
-        ghosts: ?*Ghosts,
+        ctx: *ApplyContext,
     ) void {
-        self.executeRegion(.interior, block_idx, block, inputs, outputs, ghosts);
-    }
-
-    pub fn executeBoundary(
-        self: *Kernel,
-        block_idx: usize,
-        block: *const Tree.BlockType,
-        inputs: *Arena,
-        outputs: *Arena,
-        ghosts: ?*Ghosts,
-    ) void {
-        self.executeRegion(.boundary, block_idx, block, inputs, outputs, ghosts);
-    }
-
-    const SiteRegion = enum { interior, boundary };
-    fn executeRegion(
-        self: *Kernel,
-        region: SiteRegion,
-        block_idx: usize,
-        block: *const Tree.BlockType,
-        inputs: *Arena,
-        outputs: *Arena,
-        ghosts: ?*Ghosts,
-    ) void {
-        _ = self;
         _ = block;
         const slot = self.tree.getFieldSlot(block_idx);
-        const in = inputs.getSlotConst(slot);
-        const out = outputs.getSlot(slot);
-        _ = in;
-        _ = out;
-        _ = ghosts;
-        _ = region;
+        const in = ctx.field_in orelse return;
+        const out = ctx.field_out orelse return;
+        const src = in.getSlotConst(slot);
+        const dst = out.getSlot(slot);
+        _ = src;
+        _ = dst;
     }
 };
 
+var tree = try Tree.init(allocator, 1.0, 2, 8);
+defer tree.deinit();
+var arena_in = try Arena.init(allocator, 16);
+defer arena_in.deinit();
+var arena_out = try Arena.init(allocator, 16);
+defer arena_out.deinit();
+var ghosts = try Ghosts.init(allocator, 16);
+defer ghosts.deinit();
+
+var ctx = ApplyContext.init(&tree);
+ctx.setFields(&arena_in, &arena_out);
+ctx.setFieldGhosts(&ghosts);
+
 var kernel = Kernel{ .tree = &tree };
-try ghosts.ensureForTree(&tree);
-try tree.apply(&kernel, &arena_in, &arena_out, &ghosts);
+try tree.apply(&kernel, &ctx);
 ```
 
 ### block.zig - AMR Block Implementation
@@ -498,12 +479,12 @@ block_index: usize             // Index in tree
 
 Blocks store no neighbor arrays; use `AMRTree.neighborInfo` and `AMRTree.collectFineNeighbors` for adjacency.
 
-## Ghost Layer Filling (ghost.zig)
+## Ghost Layer Filling (AMRTree)
 
-Push Model ghost communication: fine blocks pull from coarse, then push to coarse.
+Push-model ghost communication: fine blocks pull from coarse, then push to coarse. Use
+the tree methods to avoid depending on low-level ghost helpers.
 
 ```zig
-const ghost = @import("amr").ghost;
 const Ghosts = amr.GhostBuffer(MyFrontend);
 const Tree = amr.AMRTree(MyFrontend);
 
@@ -513,7 +494,7 @@ defer ghosts.deinit();
 
 // Fill all ghosts (two-phase: pull + push)
 try ghosts.ensureForTree(&tree);
-ghost.fillGhostLayers(Tree, &tree, &field_arena, ghosts.slice(tree.blocks.items.len));
+try tree.fillGhostLayers(&field_arena, ghosts.slice(tree.blocks.items.len));
 ```
 
 **Push Model Architecture:**
@@ -525,9 +506,9 @@ ghost.fillGhostLayers(Tree, &tree, &field_arena, ghosts.slice(tree.blocks.items.
 try ghosts.ensureForTree(&tree);
 const ghost_ptrs = ghosts.slice(tree.blocks.items.len);
 
-ghost.beginGhostExchange(Tree, &tree, &field_arena, ghost_ptrs);
+var state = try tree.beginGhostExchange(&field_arena, ghost_ptrs);
 // ... do interior compute here ...
-ghost.finishGhostExchange(Tree, &tree, &field_arena, ghost_ptrs);
+try tree.finishGhostExchange(&state);
 // ... do boundary compute here ...
 ```
 
@@ -662,9 +643,11 @@ const PeriodicTopo = amr.PeriodicTopology(4, .{ 16.0, 16.0, 16.0, 16.0 });
 const ComplexScalar = amr.frontend.ComplexScalarFrontend(4, 16, PeriodicTopo);  // 4D, Complex
 ```
 
-## Gauge-Specific: GaugeTree (gauge/tree.zig)
+## Gauge-Specific: GaugeField + AMRTree (gauge/field.zig)
 
-High-level API for gauge theory on AMR meshes. Wraps AMR tree with automatic link storage and ghost management.
+`GaugeField` manages link storage and ghost buffers, while `AMRTree` owns the mesh and
+field arenas. This keeps storage separate from the frontend and allows multiple frontends
+to share the same AMR backend.
 
 ```zig
 const amr = @import("amr");
@@ -672,56 +655,54 @@ const gauge = @import("gauge");
 
 const Topology = amr.PeriodicTopology(4, .{ 16.0, 16.0, 16.0, 16.0 });
 const Frontend = gauge.GaugeFrontend(3, 4, 4, 16, Topology);  // SU(3), Dirac, 4D
-const GT = gauge.GaugeTree(Frontend);
+const Tree = amr.AMRTree(Frontend);
+const Field = gauge.GaugeField(Frontend);
+const LinkOps = gauge.LinkOperators(Frontend);
 
-var tree = try GT.init(allocator, 1.0, 4, 8);
+var tree = try Tree.init(allocator, 1.0, 4, 8);
 defer tree.deinit();
+var field = try Field.init(allocator, &tree);
+defer field.deinit();
 
-// GaugeTree exports FieldArena for matter fields
-var psi_arena = try GT.FieldArena.init(allocator, 256);
+// FieldArena is AMR-owned
+var psi_arena = try amr.FieldArena(Frontend).init(allocator, 256);
 defer psi_arena.deinit();
 
-// Insert blocks (links allocated automatically)
+// Insert blocks, then sync link storage
 _ = try tree.insertBlock(.{0, 0, 0, 0}, 0);
+try field.syncWithTree(&tree);
 
 // Access links
-const link = tree.getLink(block_idx, site, mu);
-tree.setLink(block_idx, site, mu, new_link);
+const link = field.getLink(block_idx, site, mu);
+field.setLink(block_idx, site, mu, new_link);
 
-// Fill ghost layers before cross-block operations
-try tree.fillGhosts();
+// Fill link ghosts before cross-block operations
+try field.fillGhosts(&tree);
 
-// Compute plaquette (ghost handling is internal)
-const plaq = tree.computePlaquette(block_idx, site, mu, nu);
+// Compute plaquette via LinkOperators
+const plaq = LinkOps.computePlaquette(&tree, &field, block_idx, site, mu, nu);
 ```
 
-Threaded kernel execution uses the underlying AMR tree:
+Threaded kernel execution uses `AMRTree.apply` with `ApplyContext`:
 ```zig
-try tree.tree.apply(&kernel, inputs, outputs, ghosts);
+const ApplyContext = amr.ApplyContext(Frontend);
+var ctx = ApplyContext.init(&tree);
+ctx.setEdges(&field.arena, &field.ghosts);
+try field.fillGhosts(&tree);
+try tree.apply(&kernel, &ctx);
 ```
 
-If a kernel needs link ghosts, implement the optional ghost hooks by forwarding to
-`prepareLinkGhostExchange`, `fillGhostsPull`, `fillGhostsPush`, and `finalizeLinkGhostExchange`.
+**Key Pattern: Tests Use GaugeField + AMRTree**
 
-**Type: `GaugeTree(Frontend)`**
-
-**Exports:**
-- `FieldArena` - Re-exports `amr.FieldArena(Frontend)` for convenience
-- `FrontendType`, `TreeType`, `BlockType`, `LinkType`, `FieldType`
-- `volume`, `dimensions`, `gauge_group_dim`, `N_field`, `num_faces`
-
-**Key Pattern: Tests Use GaugeTree, Not Raw AMR**
-
-For gauge-related tests, import everything from the gauge module:
+For gauge-related tests, use gauge and AMR types together:
 ```zig
-const gauge = @import("gauge");
-const GT = gauge.GaugeTree(Frontend);
-const FieldArena = GT.FieldArena;  // From GaugeTree, not amr directly
+const Field = gauge.GaugeField(Frontend);
+const FieldArena = amr.FieldArena(Frontend);
 ```
 
 ## Physics: HMC Force (physics/force_amr.zig)
 
-Force computation for Hybrid Monte Carlo using GaugeTree. Features differentiable link prolongation and chain rule transmission across refinement boundaries.
+Force computation for Hybrid Monte Carlo using `AMRTree` + `GaugeField`. Features differentiable link prolongation and chain rule transmission across refinement boundaries.
 
 ---
 
@@ -756,7 +737,6 @@ _ = try tree.insertBlockWithField(.{0, 0, 0, 0}, 0, &field_arena);
 ### Ghost Filling
 
 ```zig
-const ghost = @import("amr").ghost;
 const Ghosts = amr.GhostBuffer(MyFrontend);
 
 // Allocate ghost storage
@@ -765,7 +745,7 @@ defer ghosts.deinit();
 
 // Fill ghosts for field data
 try ghosts.ensureForTree(&tree);
-ghost.fillGhostLayers(Tree, &tree, &field_arena, ghosts.slice(tree.blocks.items.len));
+try tree.fillGhostLayers(&field_arena, ghosts.slice(tree.blocks.items.len));
 ```
 
 ### Mesh Adaptation
@@ -820,12 +800,13 @@ amr (imports math, platform) - Domain-agnostic infrastructure
 gauge (imports math, amr, constants, platform) - Gauge-specific extensions
   ├── frontend (GaugeFrontend)
   ├── operators (LinkOperators for gauge links)
-  └── tree (GaugeTree - wraps AMR tree with link storage)
+  ├── field (GaugeField - link storage + ghosts for AMRTree)
+  └── repartition (MPI repartition helpers for GaugeField)
 
 physics (imports amr, gauge, math, stats, constants) - Physics modules
-  ├── hamiltonian_amr (scalar Hamiltonian using GaugeTree)
-  ├── hamiltonian_dirac_amr (Dirac Hamiltonian using GaugeTree)
-  └── force_amr (HMC force calculation using GaugeTree)
+  ├── hamiltonian_amr (scalar Hamiltonian using AMRTree + GaugeField)
+  ├── hamiltonian_dirac_amr (Dirac Hamiltonian using AMRTree + GaugeField)
+  └── force_amr (HMC force calculation using AMRTree + GaugeField)
 ```
 
 **Key Design: AMR is Domain-Agnostic**

@@ -16,12 +16,13 @@ fn zeroPotential(pos: [2]f64, spacing: f64) f64 {
 test "HamiltonianAMR pipeline matches bulk sync" {
     const Topology = amr.topology.OpenTopology(2, .{ 32.0, 32.0 });
     const Frontend = gauge.GaugeFrontend(1, 1, 2, 8, Topology);
-    const GT = gauge.GaugeTree(Frontend);
-    const FieldArena = GT.FieldArena;
+    const Tree = amr.AMRTree(Frontend);
+    const GaugeField = gauge.GaugeField(Frontend);
+    const FieldArena = amr.FieldArena(Frontend);
     const GhostBuffer = amr.GhostBuffer(Frontend);
     const HAMR = physics.hamiltonian_amr.HamiltonianAMR(Frontend);
     const ApplyContext = amr.ApplyContext(Frontend);
-    const Block = GT.BlockType;
+    const Block = Tree.BlockType;
 
     var psi_arena = try FieldArena.init(std.testing.allocator, 16);
     defer psi_arena.deinit();
@@ -32,13 +33,16 @@ test "HamiltonianAMR pipeline matches bulk sync" {
     var out_pipe = try FieldArena.init(std.testing.allocator, 16);
     defer out_pipe.deinit();
 
-    var gauge_tree = try GT.init(std.testing.allocator, 1.0, 4, 8);
-    defer gauge_tree.deinit();
+    var tree = try Tree.init(std.testing.allocator, 1.0, 4, 8);
+    defer tree.deinit();
+    var field = try GaugeField.init(std.testing.allocator, &tree);
+    defer field.deinit();
 
     // Two adjacent blocks to exercise same-level ghosts.
-    const left_idx = try gauge_tree.insertBlockWithField(.{ 0, 0 }, 0, &psi_arena);
-    const right_idx = try gauge_tree.insertBlockWithField(.{ Block.size, 0 }, 0, &psi_arena);
+    const left_idx = try tree.insertBlockWithField(.{ 0, 0 }, 0, &psi_arena);
+    const right_idx = try tree.insertBlockWithField(.{ Block.size, 0 }, 0, &psi_arena);
     _ = right_idx;
+    try field.syncWithTree(&tree);
 
     // Keep output arenas in lockstep with input slots.
     _ = out_bulk.allocSlot() orelse unreachable;
@@ -50,12 +54,12 @@ test "HamiltonianAMR pipeline matches bulk sync" {
     defer ghosts.deinit();
 
     const mass = 1.0;
-    var H = HAMR.init(&gauge_tree, mass, zeroPotential);
+    var H = HAMR.init(&tree, &field, mass, zeroPotential);
 
     // Initialize psi with block- and site-dependent values.
-    for (gauge_tree.tree.blocks.items, 0..) |*block, idx| {
+    for (tree.blocks.items, 0..) |*block, idx| {
         if (block.block_index == std.math.maxInt(usize)) continue;
-        const slot = gauge_tree.tree.getFieldSlot(idx);
+        const slot = tree.getFieldSlot(idx);
         if (slot == std.math.maxInt(usize)) continue;
         const psi = psi_arena.getSlot(slot);
         for (psi, 0..) |*v, i| {
@@ -64,19 +68,19 @@ test "HamiltonianAMR pipeline matches bulk sync" {
         }
     }
 
-    try ghosts.ensureForTree(&gauge_tree.tree);
-    try gauge_tree.tree.fillGhostLayers(&psi_arena, ghosts.slice(gauge_tree.tree.blocks.items.len));
-    try gauge_tree.fillGhosts();
+    try ghosts.ensureForTree(&tree);
+    try tree.fillGhostLayers(&psi_arena, ghosts.slice(tree.blocks.items.len));
+    try field.fillGhosts(&tree);
 
     // Manual bulk sync: iterate blocks and call execute() with ApplyContext
-    var ctx_bulk = ApplyContext.init(&gauge_tree.tree);
+    var ctx_bulk = ApplyContext.init(&tree);
     ctx_bulk.field_in = &psi_arena;
     ctx_bulk.field_out = &out_bulk;
     ctx_bulk.field_ghosts = &ghosts;
 
-    for (gauge_tree.tree.blocks.items, 0..) |*block, idx| {
+    for (tree.blocks.items, 0..) |*block, idx| {
         if (block.block_index == std.math.maxInt(usize)) continue;
-        const slot = gauge_tree.tree.getFieldSlot(idx);
+        const slot = tree.getFieldSlot(idx);
         if (slot == std.math.maxInt(usize)) continue;
 
         H.execute(idx, block, &ctx_bulk);
@@ -85,9 +89,9 @@ test "HamiltonianAMR pipeline matches bulk sync" {
     // Pipeline path: use apply() convenience wrapper
     try H.apply(&psi_arena, &out_pipe, &ghosts, null);
 
-    for (gauge_tree.tree.blocks.items, 0..) |*block, idx| {
+    for (tree.blocks.items, 0..) |*block, idx| {
         if (block.block_index == std.math.maxInt(usize)) continue;
-        const slot = gauge_tree.tree.getFieldSlot(idx);
+        const slot = tree.getFieldSlot(idx);
         if (slot == std.math.maxInt(usize)) continue;
 
         const bulk = out_bulk.getSlot(slot);

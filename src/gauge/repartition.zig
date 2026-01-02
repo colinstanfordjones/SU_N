@@ -1,55 +1,65 @@
-//! MPI repartitioning helpers for GaugeTree (entropy-weighted Morton contiguous).
+//! MPI repartitioning helpers for gauge fields (entropy-weighted Morton contiguous).
 
 const std = @import("std");
 const amr = @import("amr");
+const field_mod = @import("field.zig");
 
-pub fn GaugePolicy(comptime GaugeTree: type) type {
+pub fn GaugePolicy(comptime Frontend: type) type {
+    const Tree = amr.AMRTree(Frontend);
+    const FieldArena = amr.FieldArena(Frontend);
+    const GaugeField = field_mod.GaugeField(Frontend);
+    const Link = Frontend.LinkType;
+
     return struct {
         pub const Context = struct {
-            tree: *GaugeTree.TreeType,
-            arena: *GaugeTree.FieldArena,
-            gauge: *GaugeTree,
+            tree: *Tree,
+            arena: *FieldArena,
+            field: *GaugeField,
         };
 
         pub fn extraBytes(_: Context) usize {
-            return GaugeTree.BlockType.volume * GaugeTree.dimensions * @sizeOf(GaugeTree.LinkType);
+            return Tree.BlockType.volume * Tree.dimensions * @sizeOf(Link);
         }
 
         pub fn extraAlignment(_: Context) u29 {
-            return @alignOf(GaugeTree.LinkType);
+            return @alignOf(Link);
         }
 
         pub fn packExtra(ctx: Context, block_idx: usize, dest: []u8) void {
-            const links = ctx.gauge.getBlockLinksConst(block_idx) orelse {
+            const links = ctx.field.getBlockLinks(block_idx) orelse {
                 @memset(dest, 0);
                 return;
             };
-            std.debug.assert(dest.len == links.len * @sizeOf(GaugeTree.LinkType));
+            std.debug.assert(dest.len == links.len * @sizeOf(Link));
             std.mem.copyForwards(u8, dest, std.mem.sliceAsBytes(links));
         }
 
         pub fn unpackExtra(ctx: Context, block_idx: usize, src: []const u8) void {
-            if (ctx.gauge.getBlockLinksMut(block_idx)) |links| {
-                std.debug.assert(src.len == links.len * @sizeOf(GaugeTree.LinkType));
+            if (ctx.field.getBlockLinksMut(block_idx)) |links| {
+                std.debug.assert(src.len == links.len * @sizeOf(Link));
                 std.mem.copyForwards(u8, std.mem.sliceAsBytes(links), src);
             }
         }
 
         pub fn insertBlock(
             ctx: Context,
-            origin: [GaugeTree.dimensions]usize,
+            origin: [Tree.dimensions]usize,
             level: u8,
             has_field: bool,
         ) !usize {
-            if (has_field) {
-                return ctx.gauge.insertBlockWithField(origin, level, ctx.arena);
-            }
-            return ctx.gauge.insertBlock(origin, level);
+            const block_idx = if (has_field)
+                try ctx.tree.insertBlockWithField(origin, level, ctx.arena)
+            else
+                try ctx.tree.insertBlock(origin, level);
+            try ctx.field.syncWithTree(ctx.tree);
+            return block_idx;
         }
 
         pub fn compact(ctx: Context, options: amr.repartition.RepartitionOptions) !void {
             if (!options.compact) return;
-            try ctx.gauge.reorder();
+            const perm = try ctx.tree.reorder();
+            defer ctx.tree.allocator.free(perm);
+            try ctx.field.reorder(perm);
             if (options.defragment) {
                 try ctx.arena.defragmentWithOrder(ctx.tree.field_slots.items, ctx.tree.blockCount());
             }
@@ -58,38 +68,40 @@ pub fn GaugePolicy(comptime GaugeTree: type) type {
 }
 
 pub fn repartitionEntropyWeighted(
-    comptime GaugeTree: type,
-    tree: *GaugeTree,
-    arena: *GaugeTree.FieldArena,
-    shard: *GaugeTree.TreeType.ShardContext,
+    comptime Frontend: type,
+    tree: *amr.AMRTree(Frontend),
+    field: *field_mod.GaugeField(Frontend),
+    arena: *amr.FieldArena(Frontend),
+    shard: *amr.AMRTree(Frontend).ShardContext,
     options: amr.repartition.RepartitionOptions,
 ) !void {
     var opts = options;
     opts.compact = true;
 
-    const Policy = GaugePolicy(GaugeTree);
-    const ctx = Policy.Context{ .tree = &tree.tree, .arena = arena, .gauge = tree };
+    const Policy = GaugePolicy(Frontend);
+    const ctx = Policy.Context{ .tree = tree, .arena = arena, .field = field };
 
-    try amr.repartition.repartitionEntropyWeightedWithPolicy(GaugeTree.TreeType, Policy, ctx, shard, opts);
-    tree.ghosts_valid = false;
+    try amr.repartition.repartitionEntropyWeightedWithPolicy(amr.AMRTree(Frontend), Policy, ctx, shard, opts);
+    field.ghosts.invalidateAll();
 }
 
 pub fn repartitionAdaptiveEntropyWeighted(
-    comptime GaugeTree: type,
-    tree: *GaugeTree,
-    arena: *GaugeTree.FieldArena,
-    shard: *GaugeTree.TreeType.ShardContext,
+    comptime Frontend: type,
+    tree: *amr.AMRTree(Frontend),
+    field: *field_mod.GaugeField(Frontend),
+    arena: *amr.FieldArena(Frontend),
+    shard: *amr.AMRTree(Frontend).ShardContext,
     options: amr.repartition.RepartitionOptions,
     adaptive: amr.repartition.AdaptiveOptions,
 ) !bool {
     var opts = options;
     opts.compact = true;
 
-    const Policy = GaugePolicy(GaugeTree);
-    const ctx = Policy.Context{ .tree = &tree.tree, .arena = arena, .gauge = tree };
+    const Policy = GaugePolicy(Frontend);
+    const ctx = Policy.Context{ .tree = tree, .arena = arena, .field = field };
 
     const did_repartition = try amr.repartition.repartitionAdaptiveEntropyWeightedWithPolicy(
-        GaugeTree.TreeType,
+        amr.AMRTree(Frontend),
         Policy,
         ctx,
         shard,
@@ -97,7 +109,7 @@ pub fn repartitionAdaptiveEntropyWeighted(
         adaptive,
     );
     if (did_repartition) {
-        tree.ghosts_valid = false;
+        field.ghosts.invalidateAll();
     }
     return did_repartition;
 }

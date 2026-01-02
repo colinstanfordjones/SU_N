@@ -58,7 +58,6 @@ pub fn EdgeArena(comptime Frontend: type) type {
         pub const Edge = EdgeType;
         pub const block_volume = volume;
         pub const num_edges = edges_per_block;
-        pub const num_links = num_edges; // Compatibility alias for gauge code.
         pub const dimensions = Nd;
 
         /// Pre-allocated edge storage for all possible blocks
@@ -183,11 +182,6 @@ pub fn EdgeArena(comptime Frontend: type) type {
             return self.storage[slot][site * Nd + mu];
         }
 
-        /// Compatibility alias for getEdge.
-        pub fn getLink(self: *const Self, slot: usize, site: usize, mu: usize) EdgeType {
-            return self.getEdge(slot, site, mu);
-        }
-
         /// Set edge at specific site and direction
         pub fn setEdge(self: *Self, slot: usize, site: usize, mu: usize, value: EdgeType) void {
             std.debug.assert(slot < self.max_blocks);
@@ -196,22 +190,12 @@ pub fn EdgeArena(comptime Frontend: type) type {
             self.storage[slot][site * Nd + mu] = value;
         }
 
-        /// Compatibility alias for setEdge.
-        pub fn setLink(self: *Self, slot: usize, site: usize, mu: usize, value: EdgeType) void {
-            self.setEdge(slot, site, mu, value);
-        }
-
         /// Get pointer to edge at specific site and direction (for in-place modification)
         pub fn getEdgePtr(self: *Self, slot: usize, site: usize, mu: usize) *EdgeType {
             std.debug.assert(slot < self.max_blocks);
             std.debug.assert(site < volume);
             std.debug.assert(mu < Nd);
             return &self.storage[slot][site * Nd + mu];
-        }
-
-        /// Compatibility alias for getEdgePtr.
-        pub fn getLinkPtr(self: *Self, slot: usize, site: usize, mu: usize) *EdgeType {
-            return self.getEdgePtr(slot, site, mu);
         }
 
         /// Number of currently allocated slots
@@ -248,11 +232,6 @@ pub fn EdgeArena(comptime Frontend: type) type {
             for (edges) |*edge| {
                 edge.* = value;
             }
-        }
-
-        /// Initialize all edges in a slot to identity (falls back to zero if no identity).
-        pub fn initSlotToIdentity(self: *Self, slot: usize) void {
-            self.initSlotToDefault(slot);
         }
 
         /// Defragment arena storage to match a new block ordering.
@@ -353,7 +332,7 @@ test "EdgeArena - edge access" {
     defer arena.deinit();
 
     const slot = arena.allocSlot().?;
-    arena.initSlotToIdentity(slot);
+    arena.initSlotToDefault(slot);
 
     // All edges should be identity
     const edge = arena.getEdge(slot, 0, 0);

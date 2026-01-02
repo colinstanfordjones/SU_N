@@ -10,7 +10,7 @@ const field_math = @import("field_math.zig");
 /// Interface for Ghost Policy.
 /// Types matching this interface can be used with DistGhostExchange.
 ///
-/// Context: An opaque context passed to all methods (e.g. FieldArena, GaugeTree).
+/// Context: An opaque context passed to all methods (e.g. FieldArena, GaugeField).
 /// Block: The AMR block type.
 /// Payload: The type of data elements being exchanged (e.g. FieldType, Link).
 pub fn FieldGhostPolicy(comptime Tree: type) type {
@@ -244,4 +244,3 @@ fn addFace(comptime Field: type, dst: []Field, src: []const Field) void {
         d.* = field_math.addField(Field, d.*, s);
     }
 }
-

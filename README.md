@@ -20,7 +20,7 @@
 *   **`AMRTree`**: The core linear octree. Manages block lifecycle, neighbor lookups, and load balancing.
 *   **`DistExchange`**: A unified communication layer handling both local memory copies (shared memory) and MPI message passing (distributed memory).
 *   **`FluxRegister`**: Tracks fluxes across resolution boundaries to enforce conservation laws.
-*   **`GaugeTree`**: An extension for Lattice Gauge Theory (QCD), managing link variables and covariant derivatives.
+*   **`GaugeField` + `AMRTree`**: Lattice gauge theory support with link storage and covariant derivatives decoupled from mesh logic.
 
 ## ⚡ Performance
 

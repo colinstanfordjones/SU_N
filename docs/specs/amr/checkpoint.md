@@ -23,7 +23,7 @@ Checkpoint snapshots include:
 - `AMRTree.field_slots` (block index -> arena slot map)
 - `FieldArena.storage` (full storage for all slots)
 - `FieldArena.free_slots` + `free_count`
-- Optional gauge link storage (`GaugeTree.links`)
+- Optional gauge link storage (`GaugeField` link data)
 
 Checkpoint snapshots do **not** include:
 
@@ -63,8 +63,8 @@ Payload (in order):
 ```
 
 **Extension Data:**
-Consumers (like `GaugeTree`) may append data after the standard payload.
-For example, `GaugeTree` appends:
+Consumers (like `GaugeField`) may append data after the standard payload.
+For example, `GaugeField` appends:
 - Magic: "LINK"
 - Num Blocks: u64
 - Links per Block: u64
@@ -92,29 +92,34 @@ var state = try Ckpt.read(allocator, reader);
 defer state.deinit();
 ```
 
-Gauge tree snapshots use the `GaugeTree` methods which wrap the core checkpointing:
+Gauge link snapshots use `GaugeField` methods alongside the core tree checkpoint:
 
 ```zig
 const Frontend = gauge.GaugeFrontend(1, 1, 4, 16, amr.topology.OpenTopology(4, .{ 16.0, 16.0, 16.0, 16.0 }));
-const GaugeTree = gauge.GaugeTree(Frontend);
+const Tree = amr.AMRTree(Frontend);
 const Arena = amr.FieldArena(Frontend);
+const Field = gauge.GaugeField(Frontend);
+const TreeCheckpoint = checkpoint.TreeCheckpoint(Tree);
 
-// Write
-try gauge_tree.writeCheckpoint(&arena, writer);
+var tree = try Tree.init(allocator, 1.0, 4, 8);
+defer tree.deinit();
+var field = try Field.init(allocator, &tree);
+defer field.deinit();
+var arena = try Arena.init(allocator, 16);
+defer arena.deinit();
 
-// Read (default exchange spec)
-var state = try GaugeTree.readCheckpoint(allocator, reader);
+// Write tree + arena, then append links
+try TreeCheckpoint.write(&tree, &arena, writer);
+try field.writeCheckpoint(writer);
+
+// Read tree + arena, then restore links
+var state = try TreeCheckpoint.read(allocator, reader);
 var restored_tree = state.tree;
 var restored_arena = state.arena;
+var restored_field = try Field.readCheckpoint(allocator, &restored_tree, reader);
 defer restored_tree.deinit();
 defer restored_arena.deinit();
-
-// Read with custom link exchange spec
-var state_custom = try GaugeTree.readCheckpointWithOptions(
-    allocator,
-    reader,
-    .{ .link_exchange_spec = custom_spec },
-);
+defer restored_field.deinit();
 ```
 
 ## Scheduling

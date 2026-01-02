@@ -11,33 +11,37 @@ const TestTopology4D = amr.topology.PeriodicTopology(4, .{ 16.0, 16.0, 16.0, 16.
 test "HamiltonianAMR initialization and apply" {
     // 1. Setup Frontend
     const Frontend = gauge.GaugeFrontend(1, 1, 4, 16, TestTopology4D); // U(1), scalar, 4D, 16^4
-    const GT = gauge.GaugeTree(Frontend);
-    const FieldArena = GT.FieldArena;
+    const Tree = amr.AMRTree(Frontend);
+    const GaugeField = gauge.GaugeField(Frontend);
+    const FieldArena = amr.FieldArena(Frontend);
     const GhostBuffer = amr.GhostBuffer(Frontend);
     const HAMR = physics.hamiltonian_amr.HamiltonianAMR(Frontend);
 
     var arena = try FieldArena.init(std.testing.allocator, 16);
     defer arena.deinit();
 
-    var gauge_tree = try GT.init(std.testing.allocator, 1.0, 4, 8);
-    defer gauge_tree.deinit();
+    var tree = try Tree.init(std.testing.allocator, 1.0, 4, 8);
+    defer tree.deinit();
+    var field = try GaugeField.init(std.testing.allocator, &tree);
+    defer field.deinit();
 
     // 2. Insert block
-    const block_idx = try gauge_tree.insertBlockWithField(.{0, 0, 0, 0}, 0, &arena);
+    const block_idx = try tree.insertBlockWithField(.{0, 0, 0, 0}, 0, &arena);
+    try field.syncWithTree(&tree);
     
     // 3. Setup Hamiltonian
     const mass = 1.0;
     // Free particle potential
     const potential_fn = physics.hamiltonian_amr.freeParticle;
     
-    var H = HAMR.init(&gauge_tree, mass, potential_fn);
+    var H = HAMR.init(&tree, &field, mass, potential_fn);
     
     // 4. Setup Ghost Buffer
     var ghosts = try GhostBuffer.init(std.testing.allocator, 16);
     defer ghosts.deinit();
     
     // 5. Initialize Psi
-    const slot = gauge_tree.tree.getFieldSlot(block_idx);
+    const slot = tree.getFieldSlot(block_idx);
     arena.zeroSlot(slot); // Ensure clean slate
     const psi = arena.getSlot(slot);
     for (psi) |*v| v.*[0] = Complex.init(1.0, 0.0);
@@ -58,7 +62,7 @@ test "HamiltonianAMR initialization and apply" {
     
     // Verify result (should be 0 for free particle uniform field, ignoring boundaries)
     const res = out_arena.getSlot(out_slot);
-    const Block = GT.BlockType;
+    const Block = Tree.BlockType;
     
     for (res, 0..) |v, i| {
         const coords = Block.getLocalCoords(i);

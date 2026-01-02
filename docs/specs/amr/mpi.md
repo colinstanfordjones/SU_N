@@ -5,8 +5,8 @@ This document describes the MPI-based sharding flow for AMR workloads. It focuse
 ## Goals
 
 - Shard AMR blocks across MPI ranks while preserving existing AMR data structures on each rank.
-- Overlap interior compute with ghost exchange (both field ghosts and optional link ghosts).
-- Keep the kernel interface unchanged: kernels still implement `executeInterior`/`executeBoundary` and optional ghost hooks.
+- Overlap interior compute with field ghost exchange; link ghosts are exchanged explicitly via `GaugeField`.
+- Keep the kernel interface stable: kernels implement `execute(block_idx, block, ctx)` with `ApplyContext`.
 - Provide deterministic, testable ghost exchange with minimal allocation churn.
 - Support explicit, deterministic repartitioning for dynamic load balancing.
 
@@ -99,11 +99,11 @@ const did = try amr.repartition.repartitionAdaptiveEntropyWeighted(
 );
 ```
 
-Gauge-tree usage:
+GaugeField usage:
 
 ```zig
 const opts = amr.repartition.RepartitionOptions{ .defragment = true };
-try gauge.repartition.repartitionEntropyWeighted(GaugeTree, &gauge_tree, &arena, &shard, opts);
+try gauge.repartition.repartitionEntropyWeighted(Frontend, &tree, &field, &arena, &shard, opts);
 ```
 
 Detailed algorithm notes: `docs/specs/amr/repartition.md`.

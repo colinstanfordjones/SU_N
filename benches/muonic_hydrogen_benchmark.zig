@@ -17,7 +17,8 @@ const domain_extent = @as(f64, @floatFromInt(grid_dim * block_size)) * spacing;
 const Topology4D = amr.topology.OpenTopology(4, .{ domain_extent, domain_extent, domain_extent, domain_extent });
 const HAMR = HamiltonianDiracAMR(N_gauge, block_size, Topology4D);
 const N_field = HAMR.field_dim;
-const GT = HAMR.GaugeTreeType;
+const Tree = HAMR.TreeType;
+const GaugeField = HAMR.GaugeFieldType;
 const Arena = HAMR.FieldArena;
 const Ghosts = HAMR.GhostBufferType;
 
@@ -35,8 +36,10 @@ const MuonConstants = struct {
 fn runMuonicHydrogen(allocator: std.mem.Allocator, max_steps: usize) !void {
     const print = std.debug.print;
 
-    var tree = try GT.init(allocator, spacing, 2, 8);
+    var tree = try Tree.init(allocator, spacing, 2, 8);
     defer tree.deinit();
+    var field = try GaugeField.init(allocator, &tree);
+    defer field.deinit();
 
     var psi = try Arena.init(allocator, 32);
     var workspace = try Arena.init(allocator, 32);
@@ -61,12 +64,13 @@ fn runMuonicHydrogen(allocator: std.mem.Allocator, max_steps: usize) !void {
                 const slot = psi.allocSlot() orelse return error.OutOfMemory;
                 _ = workspace.allocSlot() orelse return error.OutOfMemory;
                 _ = workspace2.allocSlot() orelse return error.OutOfMemory;
-                tree.tree.assignFieldSlot(idx, slot);
+                tree.assignFieldSlot(idx, slot);
             }
         }
     }
+    try field.syncWithTree(&tree);
 
-    var h = HAMR.init(&tree, MuonConstants.m_mu, 1.0, .coulomb);
+    var h = HAMR.init(&tree, &field, MuonConstants.m_mu, 1.0, .coulomb);
     defer h.deinit();
 
     const center_pos = @as(f64, @floatFromInt(grid_dim * block_size)) * spacing / 2.0;
@@ -75,9 +79,9 @@ fn runMuonicHydrogen(allocator: std.mem.Allocator, max_steps: usize) !void {
     const alpha_mu = MuonConstants.alpha * MuonConstants.m_mu;
 
     for (blocks.items) |b_idx| {
-        const slot = tree.tree.getFieldSlot(b_idx);
+        const slot = tree.getFieldSlot(b_idx);
         const psi_data = psi.getSlot(slot);
-        const block = &tree.tree.blocks.items[b_idx];
+        const block = &tree.blocks.items[b_idx];
 
         for (0..HAMR.block_volume) |i| {
             const pos = block.getPhysicalPosition(i);

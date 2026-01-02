@@ -20,7 +20,7 @@
 //! ## AMR-Integrated Gauge Infrastructure
 //!
 //! - `frontend`: GaugeFrontend factory for AMR-compatible frontends
-//! - `tree`: GaugeTree wraps AMRTree with gauge link storage and ghost handling
+//! - `field`: GaugeField stores link data and ghost buffers for AMRTree
 //! - `operators`: LinkOperators for gauge link prolongation/restriction
 //! - `link`: Link variables U_μ(x) ∈ SU(N) on lattice edges
 //! - `haar`: Haar measure sampling for gauge links
@@ -34,8 +34,8 @@
 //! fine structure α = g²/(4π) is derived, not hardcoded.
 //!
 //! **Locality of Behavior:**
-//! Gauge links live on AMR block edges; covariant operations use GaugeTree
-//! to keep gauge structure and boundary handling together.
+//! Gauge links live on AMR block edges; covariant operations use GaugeField
+//! to keep gauge structure and boundary handling explicit.
 //!
 //! **Compile-Time Safety:**
 //! Generic over gauge group rank N, lattice dimensions checked at compile time,
@@ -52,7 +52,6 @@ pub const spacetime = @import("spacetime.zig");
 // AMR Integration
 pub const frontend = @import("frontend.zig");
 pub const operators = @import("operators.zig");
-pub const tree = @import("tree.zig");
 pub const field = @import("field.zig");
 pub const ghost_policy = @import("ghost_policy.zig");
 pub const repartition = @import("repartition.zig");
@@ -62,15 +61,12 @@ pub const GaugeFrontend = frontend.GaugeFrontend;
 // Re-export gauge-specific AMR operators
 pub const LinkOperators = operators.LinkOperators;
 
-// Re-export GaugeTree for high-level AMR usage
-pub const GaugeTree = tree.GaugeTree;
 // Re-export GaugeField for stateless AMR usage
 pub const GaugeField = field.GaugeField;
 
 test {
     _ = frontend;
     _ = operators;
-    _ = tree;
     _ = field;
     _ = ghost_policy;
     _ = repartition;

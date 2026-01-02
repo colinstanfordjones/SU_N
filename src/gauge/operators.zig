@@ -481,7 +481,7 @@ pub fn LinkOperators(comptime Frontend: type) type {
                      // Current GhostPolicy handles faces.
                      // For staples, we might need corner info.
                      // For now, assume simplified handling or that ghosts are sufficient.
-                     // The logic in GaugeTree was:
+                     // The logic in the previous wrapper implementation was:
                      //    const link_nu_xmu_mnu = if (at_mu_boundary) blk: {
                      //        var ghost_coords = coords;
                      //        ghost_coords[nu] = coords[nu] - 1; // wrapping?
@@ -494,9 +494,9 @@ pub fn LinkOperators(comptime Frontend: type) type {
                      
                      // Let's assume for now we don't support full corner staples in this refactor pass 
                      // if it wasn't strictly correct before.
-                     // Actually GaugeTree had `if (coords[nu] > 0)` check only!
+                     // Actually the previous wrapper had `if (coords[nu] > 0)` check only!
                      // So it ignored boundary staples in backward direction if on boundary?
-                     // That seems like a bug in GaugeTree or a simplification.
+                     // That seems like a bug or a simplification in the old path.
                      // "if (coords[nu] > 0)" implies staples are incomplete at -nu boundary.
                      // I will copy that logic to maintain parity.
                 }

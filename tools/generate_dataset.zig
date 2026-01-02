@@ -60,8 +60,9 @@ pub fn main() !void {
 
     // Frontend setup
     const Frontend = gauge.GaugeFrontend(N, 1, Nd, block_size, Topology); // 1 spinor component (scalar)
-    const GaugeTree = gauge.GaugeTree(Frontend);
-    const FieldArena = GaugeTree.FieldArena;
+    const Tree = amr.AMRTree(Frontend);
+    const GaugeField = gauge.GaugeField(Frontend);
+    const FieldArena = amr.FieldArena(Frontend);
     const GhostBuffer = amr.GhostBuffer(Frontend);
     const HAMR = HamiltonianAMR(Frontend);
     const Exp = exporter.Exporter(Frontend);
@@ -69,8 +70,10 @@ pub fn main() !void {
     for (0..num_samples) |s| {
         std.debug.print("Generating sample {d}/{d}...\n", .{ s + 1, num_samples });
 
-        var tree = try GaugeTree.init(allocator, 1.0, 4, 8);
+        var tree = try Tree.init(allocator, 1.0, 4, 8);
         defer tree.deinit();
+        var field = try GaugeField.init(allocator, &tree);
+        defer field.deinit();
 
         var psi = try FieldArena.init(allocator, 256);
         defer psi.deinit();
@@ -93,16 +96,17 @@ pub fn main() !void {
 
         // Initialize root block
         const b0 = try tree.insertBlockWithField(.{ 0, 0, 0, 0 }, 0, &psi);
+        try field.syncWithTree(&tree);
         _ = workspace.allocSlot(); // Allocate matching workspace slot
 
         // Initial noise to seed the evolution
-        const slot = tree.tree.getFieldSlot(b0);
+        const slot = tree.getFieldSlot(b0);
         const psi_data = psi.getSlot(slot);
         for (psi_data) |*v| {
             v.*[0] = Complex.init(rand.floatNorm(f64), rand.floatNorm(f64));
         }
 
-        var H = HAMR.init(&tree, 1.0, &randomPotential);
+        var H = HAMR.init(&tree, &field, 1.0, &randomPotential);
         defer H.deinit();
 
         H.normalizeAMR(&psi);
@@ -127,16 +131,17 @@ pub fn main() !void {
         const full_path = try std.fs.path.join(allocator, &.{ output_dir, filename });
         defer allocator.free(full_path);
 
-        // Pass 'null' for link storage as GaugeTree stores links internally, but Exporter expects external link storage if has_links is true.
-        // Wait, Exporter logic:
-        // const LinkStorageType = if (has_link_type) []const []const LinkType else void;
-        // GaugeTree doesn't easily expose []const []const LinkType.
-        // It has tree.links.items which is []const []Link.
-        // Slice of slices.
-        // So we can pass tree.links.items.
-        
         const exp = Exp.init(.{ .export_psi = true, .export_full_psi = true, .export_links = true });
-        try exp.writeToFile(&tree.tree, &psi, tree.links.items, full_path);
+        var link_slices = try allocator.alloc([]const Frontend.LinkType, tree.blocks.items.len);
+        defer allocator.free(link_slices);
+        for (tree.blocks.items, 0..) |*block, idx| {
+            if (block.block_index == std.math.maxInt(usize)) {
+                link_slices[idx] = &[_]Frontend.LinkType{};
+            } else {
+                link_slices[idx] = field.getBlockLinks(idx) orelse &[_]Frontend.LinkType{};
+            }
+        }
+        try exp.writeToFile(&tree, &psi, link_slices, full_path);
     }
 
     std.debug.print("Successfully generated {d} samples in '{s}'\n", .{ num_samples, output_dir });

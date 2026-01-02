@@ -402,9 +402,6 @@ pub fn DistExchange(comptime Tree: type, comptime Context: type, comptime Payloa
             if (@TypeOf(ctx.tree) == *Tree or @TypeOf(ctx.tree) == *const Tree) {
                 return ctx.tree;
             }
-            if (@hasField(@TypeOf(ctx.tree.*), "tree")) {
-                return &ctx.tree.tree;
-            }
             @compileError("Context.tree must be *Tree or provide a .tree field");
         }
         

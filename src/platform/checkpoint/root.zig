@@ -4,7 +4,7 @@
 //! The payload is a raw byte dump of blocks, field slots, and arena storage.
 //! This is host-endian and intended for exact restart on compatible builds.
 //!
-//! Users (e.g. GaugeTree) can append their own data to the stream after calling write().
+//! Users (e.g. GaugeField) can append their own data to the stream after calling write().
 
 const std = @import("std");
 const mpi = @import("../mpi/root.zig");

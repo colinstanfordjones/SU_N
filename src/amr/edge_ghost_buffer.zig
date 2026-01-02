@@ -100,8 +100,6 @@ pub fn EdgeGhostBuffer(comptime Frontend: type) type {
             }
         };
 
-        pub const LinkGhostFaces = EdgeGhostFaces; // Compatibility alias for gauge code.
-
         allocator: std.mem.Allocator,
         slots: []?*EdgeGhostFaces,
 

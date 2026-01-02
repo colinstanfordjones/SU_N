@@ -1,47 +1,34 @@
 # AMR Apply Pipeline
 
-`AMRTree.apply` is the single kernel execution entry point. It runs a pipelined schedule on a persistent work-stealing pool owned by the tree.
+`AMRTree.apply` is the single kernel execution entry point. It runs a threaded schedule on a persistent work-stealing pool owned by the tree and uses `ApplyContext` to bind state.
 
 ## Pipeline Stages
 
-1. Ghost pull (field ghosts, plus optional kernel ghost hooks)
-2. Interior compute (overlaps with ghost pull)
-3. Ghost push (field ghosts, plus optional kernel ghost hooks)
-4. Boundary compute
+1. Ensure field ghost buffers are sized for the current tree.
+2. Exchange field ghosts when `ctx.field_in` and `ctx.field_ghosts` are set (local + MPI).
+3. Execute `kernel.execute` across all blocks on the worker pool.
 
 The pool is created during `AMRTree.init` and defaults to the machine CPU count. Task metadata is allocated from a per-group arena to avoid allocation churn.
 
 ## Kernel Interface
 
-Required methods:
+Required method:
 
 ```zig
-fn executeInterior(self: *Self, block_idx: usize, block: *const Block, inputs: anytype, outputs: anytype, ghosts: ?*GhostBuffer) void
-fn executeBoundary(self: *Self, block_idx: usize, block: *const Block, inputs: anytype, outputs: anytype, ghosts: ?*GhostBuffer) void
+fn execute(self: *Self, block_idx: usize, block: *const Block, ctx: *ApplyContext) void
 ```
 
-Optional ghost hooks (all or none):
+## ApplyContext Configuration
 
-```zig
-fn ghostPrepare(self: *Self) !bool           // return true if exchange needed
-fn ghostPull(self: *Self, block_idx: usize) void
-fn ghostPush(self: *Self, block_idx: usize) void
-fn ghostFinalize(self: *Self) void
-```
-
-`ghostPrepare` is called once at the start. If it returns `false`, the other hook stages are skipped.
-
-## Inputs, Outputs, and Ghosts
-
-- `inputs` and `outputs` are `anytype` so kernels can accept pointers, structs, or `void`.
-- If `inputs` is a struct, the first element is treated as the field arena for field ghost exchange.
-- If `inputs` is `void`, field ghost exchange is skipped.
-- `ghosts` is optional; if provided, `AMRTree.apply` ensures capacity for the tree.
-- If a shard context is attached via `tree.attachShard(&shard)`, `AMRTree.apply` performs MPI ghost exchange in addition to local ghosts.
+- `ctx.setFields(&arena_in, &arena_out)` configures field input/output.
+- `ctx.setFieldGhosts(&ghosts)` enables field ghost exchange.
+- `ctx.setEdges(&edge_arena, &edge_ghosts)` passes edge-centered data (ghost exchange is explicit).
+- Edge-centered storage is supported today; face- and node-centered storage are planned extensions.
+- If a shard context is attached via `tree.attachShard(&shard)`, `AMRTree.apply` performs MPI ghost exchange for fields.
 
 ## Neighbor Queries (No Cached Neighbor Arrays)
 
-Blocks no longer store neighbor indices. If a kernel needs topology-level adjacency information,
+Blocks do not store neighbor indices. If a kernel needs topology-level adjacency information,
 query the tree at runtime:
 
 ```zig
@@ -65,80 +52,60 @@ const Frontend = amr.ScalarFrontend(2, 8, amr.topology.OpenTopology(2, .{ 16.0, 
 const Tree = amr.AMRTree(Frontend);
 const Arena = amr.FieldArena(Frontend);
 const Ghosts = amr.GhostBuffer(Frontend);
+const ApplyContext = amr.ApplyContext(Frontend);
 
 const Kernel = struct {
     tree: *const Tree,
 
-    pub fn executeInterior(
+    pub fn execute(
         self: *Kernel,
         block_idx: usize,
         block: *const Tree.BlockType,
-        inputs: *Arena,
-        outputs: *Arena,
-        ghosts: ?*Ghosts,
+        ctx: *ApplyContext,
     ) void {
-        self.executeRegion(.interior, block_idx, block, inputs, outputs, ghosts);
-    }
-
-    pub fn executeBoundary(
-        self: *Kernel,
-        block_idx: usize,
-        block: *const Tree.BlockType,
-        inputs: *Arena,
-        outputs: *Arena,
-        ghosts: ?*Ghosts,
-    ) void {
-        self.executeRegion(.boundary, block_idx, block, inputs, outputs, ghosts);
-    }
-
-    const SiteRegion = enum { interior, boundary };
-    fn executeRegion(
-        self: *Kernel,
-        region: SiteRegion,
-        block_idx: usize,
-        block: *const Tree.BlockType,
-        inputs: *Arena,
-        outputs: *Arena,
-        ghosts: ?*Ghosts,
-    ) void {
-        _ = self;
         _ = block;
-        _ = ghosts;
-        _ = region;
         const slot = self.tree.getFieldSlot(block_idx);
-        const in = inputs.getSlotConst(slot);
-        const out = outputs.getSlot(slot);
-        _ = in;
-        _ = out;
+        const in = ctx.field_in orelse return;
+        const out = ctx.field_out orelse return;
+        const src = in.getSlotConst(slot);
+        const dst = out.getSlot(slot);
+        _ = src;
+        _ = dst;
     }
 };
 
 var tree = try Tree.init(allocator, 1.0, 2, 8);
+defer tree.deinit();
 var arena_in = try Arena.init(allocator, 16);
+defer arena_in.deinit();
 var arena_out = try Arena.init(allocator, 16);
+defer arena_out.deinit();
 var ghosts = try Ghosts.init(allocator, 16);
+defer ghosts.deinit();
+
+var ctx = ApplyContext.init(&tree);
+ctx.setFields(&arena_in, &arena_out);
+ctx.setFieldGhosts(&ghosts);
 
 var kernel = Kernel{ .tree = &tree };
-try tree.apply(&kernel, &arena_in, &arena_out, &ghosts);
+try tree.apply(&kernel, &ctx);
 ```
 
 ## Link Ghosts (Gauge Kernels)
 
-If a kernel needs gauge link ghosts, use the optional ghost hooks and forward them to `GaugeTree`:
+Gauge link ghosts are exchanged explicitly via `GaugeField` (edge ghosts are not exchanged by `AMRTree.apply`):
 
 ```zig
-pub fn ghostPrepare(self: *Self) !bool {
-    return try self.gauge_tree.prepareLinkGhostExchange();
-}
-pub fn ghostPull(self: *Self, block_idx: usize) void {
-    self.gauge_tree.fillGhostsPull(block_idx);
-}
-pub fn ghostPush(self: *Self, block_idx: usize) void {
-    self.gauge_tree.fillGhostsPush(block_idx);
-}
-pub fn ghostFinalize(self: *Self) void {
-    self.gauge_tree.finalizeLinkGhostExchange();
-}
-```
+const gauge = @import("gauge");
+const Field = gauge.GaugeField(Frontend);
 
-This keeps all pipeline logic inside `AMRTree.apply` while still synchronizing link ghosts.
+var field = try Field.init(allocator, &tree);
+defer field.deinit();
+try field.syncWithTree(&tree);
+
+var ctx = ApplyContext.init(&tree);
+ctx.setEdges(&field.arena, &field.ghosts);
+try field.fillGhosts(&tree);
+
+try tree.apply(&kernel, &ctx);
+```

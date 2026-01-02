@@ -22,7 +22,7 @@
 //! - N_field = 4 * N_gauge (4 spinor components x N_gauge gauge indices)
 //! - Field layout: [spinor_idx * N_gauge + gauge_idx]
 //!
-//! Gauge links are owned by GaugeTree; AMR ghost layers handle inter-block
+//! Gauge links are owned by GaugeField; AMR ghost layers handle inter-block
 //! communication for matter fields via the Push Model.
 //!
 //! ## Units
@@ -65,8 +65,9 @@ pub fn HamiltonianDiracAMR(comptime N_gauge: usize, comptime block_size: usize, 
     const Nd = Frontend.Nd;
     const N_field = Frontend.field_dim;
 
-    const GaugeTree = gauge.GaugeTree(Frontend);
-    const Block = GaugeTree.BlockType;
+    const Tree = amr_mod.AMRTree(Frontend);
+    const GaugeField = gauge.GaugeField(Frontend);
+    const Block = Tree.BlockType;
     const Arena = amr_mod.FieldArena(Frontend);
     const GhostBuffer = amr_mod.GhostBuffer(Frontend);
     const ApplyContext = amr_mod.ApplyContext(Frontend);
@@ -77,7 +78,8 @@ pub fn HamiltonianDiracAMR(comptime N_gauge: usize, comptime block_size: usize, 
 
         // Type exports for external use
         pub const FrontendType = Frontend;
-        pub const GaugeTreeType = GaugeTree;
+        pub const TreeType = Tree;
+        pub const GaugeFieldType = GaugeField;
         pub const BlockType = Block;
         pub const LinkType = Link;
         pub const FieldArena = Arena;
@@ -90,8 +92,11 @@ pub fn HamiltonianDiracAMR(comptime N_gauge: usize, comptime block_size: usize, 
         pub const gauge_dim = N_gauge;
         pub const field_dim = N_field;
 
-        /// Reference to the GaugeTree (not owned)
-        gauge_tree: *GaugeTree,
+        /// Reference to the AMR tree (not owned)
+        tree: *Tree,
+
+        /// Reference to gauge link storage
+        field: *GaugeField,
 
         /// Particle mass
         mass: f64,
@@ -113,7 +118,8 @@ pub fn HamiltonianDiracAMR(comptime N_gauge: usize, comptime block_size: usize, 
 
         /// Initialize the Dirac AMR Hamiltonian.
         pub fn init(
-            gauge_tree: *GaugeTree,
+            tree: *Tree,
+            field: *GaugeField,
             mass: f64,
             Z: f64,
             potential_type: PotentialType,
@@ -128,7 +134,8 @@ pub fn HamiltonianDiracAMR(comptime N_gauge: usize, comptime block_size: usize, 
             };
 
             return Self{
-                .gauge_tree = gauge_tree,
+                .tree = tree,
+                .field = field,
                 .mass = mass,
                 .Z = Z,
                 .potential_type = potential_type,
@@ -140,11 +147,12 @@ pub fn HamiltonianDiracAMR(comptime N_gauge: usize, comptime block_size: usize, 
 
         /// Initialize with custom potential function.
         pub fn initWithCustomPotential(
-            gauge_tree: *GaugeTree,
+            tree: *Tree,
+            field: *GaugeField,
             mass: f64,
             potential_fn: *const fn ([Nd]f64, f64) f64,
         ) Self {
-            var self = init(gauge_tree, mass, 1.0, .custom);
+            var self = init(tree, field, mass, 1.0, .custom);
             self.custom_potential = potential_fn;
             return self;
         }
@@ -207,16 +215,19 @@ pub fn HamiltonianDiracAMR(comptime N_gauge: usize, comptime block_size: usize, 
             psi_in: *const FieldArena,
             psi_out: *FieldArena,
             ghosts: *GhostBuffer,
-            flux_reg: ?*GaugeTree.TreeType.FluxRegister,
+            flux_reg: ?*Tree.FluxRegister,
         ) !void {
             // Build ApplyContext
-            var ctx = ApplyContext.init(&self.gauge_tree.tree);
+            var ctx = ApplyContext.init(self.tree);
             ctx.field_in = psi_in;
             ctx.field_out = psi_out;
             ctx.field_ghosts = ghosts;
             ctx.flux_reg = flux_reg;
 
-            try self.gauge_tree.apply(self, &ctx);
+            try self.field.fillGhosts(self.tree);
+            ctx.setEdges(&self.field.arena, &self.field.ghosts);
+            ctx.edge_ghosts_dirty = false;
+            try self.tree.apply(self, &ctx);
         }
 
         /// Apply Dirac Hamiltonian to a single block (internal).
@@ -360,7 +371,7 @@ pub fn HamiltonianDiracAMR(comptime N_gauge: usize, comptime block_size: usize, 
 
             // Forward neighbor
             var psi_plus: [N_field]Complex = undefined;
-            const link_fwd = self.gauge_tree.getLink(block_idx, site, mu);
+            const link_fwd = self.field.getLink(block_idx, site, mu);
 
             if (coords[mu] == block_size - 1) {
                 const ghost_idx = Block.getGhostIndex(coords, face_plus);
@@ -387,21 +398,21 @@ pub fn HamiltonianDiracAMR(comptime N_gauge: usize, comptime block_size: usize, 
                 }
 
                 link_bwd = Link.identity();
-                const neighbor_info = self.gauge_tree.tree.neighborInfo(block_idx, face_minus);
+                const neighbor_info = self.tree.neighborInfo(block_idx, face_minus);
                 if (neighbor_info.exists() and neighbor_info.level_diff == 0) {
                     const neighbor_idx = neighbor_info.block_idx;
-                    if (neighbor_idx < self.gauge_tree.tree.blocks.items.len) {
+                    if (neighbor_idx < self.tree.blocks.items.len) {
                         var neighbor_coords = coords;
                         neighbor_coords[mu] = block_size - 1;
                         const neighbor_site = Block.getLocalIndex(neighbor_coords);
-                        link_bwd = self.gauge_tree.getLink(neighbor_idx, neighbor_site, mu).adjoint();
+                        link_bwd = self.field.getLink(neighbor_idx, neighbor_site, mu).adjoint();
                     }
                 }
             } else {
                 const neighbor_minus = Block.localNeighborFast(site, face_minus);
                 psi_minus = psi_in[neighbor_minus];
                 // Backward link: U_dag(x-mu, mu) = adjoint of link at neighbor pointing forward
-                link_bwd = self.gauge_tree.getLink(block_idx, neighbor_minus, mu).adjoint();
+                link_bwd = self.field.getLink(block_idx, neighbor_minus, mu).adjoint();
             }
 
             // Apply links and compute derivative for each spinor component
@@ -461,9 +472,9 @@ pub fn HamiltonianDiracAMR(comptime N_gauge: usize, comptime block_size: usize, 
             // Compute <psi|H psi> with volume weighting
             var energy: f64 = 0.0;
 
-            for (self.gauge_tree.tree.blocks.items, 0..) |*block, idx| {
+            for (self.tree.blocks.items, 0..) |*block, idx| {
                 if (block.block_index == std.math.maxInt(usize)) continue;
-                const slot = self.gauge_tree.tree.getFieldSlot(idx);
+                const slot = self.tree.getFieldSlot(idx);
                 if (slot == std.math.maxInt(usize)) continue;
 
                 const psi_data = psi.getSlotConst(slot);
@@ -490,9 +501,9 @@ pub fn HamiltonianDiracAMR(comptime N_gauge: usize, comptime block_size: usize, 
         pub fn normSquared(self: *const Self, psi: *const FieldArena) f64 {
             var norm_sq: f64 = 0.0;
 
-            for (self.gauge_tree.tree.blocks.items, 0..) |*block, idx| {
+            for (self.tree.blocks.items, 0..) |*block, idx| {
                 if (block.block_index == std.math.maxInt(usize)) continue;
-                const slot = self.gauge_tree.tree.getFieldSlot(idx);
+                const slot = self.tree.getFieldSlot(idx);
                 if (slot == std.math.maxInt(usize)) continue;
 
                 const psi_data = psi.getSlotConst(slot);
@@ -518,9 +529,9 @@ pub fn HamiltonianDiracAMR(comptime N_gauge: usize, comptime block_size: usize, 
 
             const inv_norm = 1.0 / @sqrt(norm_sq);
 
-            for (self.gauge_tree.tree.blocks.items, 0..) |*block, idx| {
+            for (self.tree.blocks.items, 0..) |*block, idx| {
                 if (block.block_index == std.math.maxInt(usize)) continue;
-                const slot = self.gauge_tree.tree.getFieldSlot(idx);
+                const slot = self.tree.getFieldSlot(idx);
                 if (slot == std.math.maxInt(usize)) continue;
 
                 const psi_data = psi.getSlot(slot);
@@ -549,9 +560,9 @@ pub fn HamiltonianDiracAMR(comptime N_gauge: usize, comptime block_size: usize, 
             try self.apply(psi, workspace1, ghosts, null);
 
             // 2. Compute phi = (H-m) psi -> workspace1
-            for (self.gauge_tree.tree.blocks.items, 0..) |*block, idx| {
+            for (self.tree.blocks.items, 0..) |*block, idx| {
                 if (block.block_index == std.math.maxInt(usize)) continue;
-                const slot = self.gauge_tree.tree.getFieldSlot(idx);
+                const slot = self.tree.getFieldSlot(idx);
                 if (slot == std.math.maxInt(usize)) continue;
 
                 const psi_data = psi.getSlotConst(slot);
@@ -571,9 +582,9 @@ pub fn HamiltonianDiracAMR(comptime N_gauge: usize, comptime block_size: usize, 
             try self.apply(workspace1, workspace2, ghosts, null);
 
             // 4. Compute (H-m) phi and update psi
-            for (self.gauge_tree.tree.blocks.items, 0..) |*block, idx| {
+            for (self.tree.blocks.items, 0..) |*block, idx| {
                 if (block.block_index == std.math.maxInt(usize)) continue;
-                const slot = self.gauge_tree.tree.getFieldSlot(idx);
+                const slot = self.tree.getFieldSlot(idx);
                 if (slot == std.math.maxInt(usize)) continue;
 
                 const psi_data = psi.getSlot(slot);

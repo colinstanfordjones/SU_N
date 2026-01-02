@@ -69,9 +69,9 @@ The fixed-size layout keeps MPI send/recv simple (no custom datatypes).
 - Weight gathering and owner assignment allocate O(total_blocks) scratch memory
   (counts, weights, owner entries); these are not currently batched.
 
-GaugeTree notes:
-- The gauge wrapper forces compaction to release link storage.
-- `GaugeTree.reorder()` keeps link and ghost arrays consistent.
+GaugeField notes:
+- The gauge helpers force compaction to keep link storage aligned with tree order.
+- `GaugeField.reorder()` remaps link and ghost storage after `tree.reorder()`.
 
 ## API
 
@@ -111,11 +111,11 @@ const did = try amr.repartition.repartitionAdaptiveEntropyWeighted(
 );
 ```
 
-GaugeTree usage:
+GaugeField usage:
 
 ```zig
 const opts = amr.repartition.RepartitionOptions{ .defragment = true };
-try gauge.repartition.repartitionEntropyWeighted(GaugeTree, &gauge_tree, &arena, &shard, opts);
+try gauge.repartition.repartitionEntropyWeighted(Frontend, &tree, &field, &arena, &shard, opts);
 ```
 
 ## Tests

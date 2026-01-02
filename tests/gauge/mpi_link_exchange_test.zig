@@ -19,19 +19,22 @@ test "mpi gauge link exchange uses full face payload" {
     const domain_extent = @as(f64, @floatFromInt(block_size * 2));
     const Topology = amr.topology.OpenTopology(Nd, .{ domain_extent, 4.0 });
     const Frontend = gauge.GaugeFrontend(1, 1, Nd, block_size, Topology);
-    const GaugeTree = gauge.GaugeTree(Frontend);
-    const Tree = GaugeTree.TreeType;
+    const Tree = amr.AMRTree(Frontend);
+    const GaugeField = gauge.GaugeField(Frontend);
     const Link = Frontend.LinkType;
     const Complex = std.math.Complex(f64);
 
-    var tree = try GaugeTree.init(std.testing.allocator, 1.0, 4, 8);
+    var tree = try Tree.init(std.testing.allocator, 1.0, 4, 8);
     defer tree.deinit();
+    var field = try GaugeField.init(std.testing.allocator, &tree);
+    defer field.deinit();
 
     const origin = .{ @as(usize, @intCast(rank)) * block_size, 0 };
     const block_idx = try tree.insertBlock(origin, 0);
+    try field.syncWithTree(&tree);
 
     const link_value = @as(f64, @floatFromInt(rank + 2));
-    if (tree.getBlockLinksMut(block_idx)) |links| {
+    if (field.getBlockLinksMut(block_idx)) |links| {
         var link = Link.identity();
         link.matrix.data[0][0] = Complex.init(link_value, 0);
         for (links) |*l| l.* = link;
@@ -39,16 +42,16 @@ test "mpi gauge link exchange uses full face payload" {
 
     var shard = try amr.ShardContext(Tree).initFromTree(
         std.testing.allocator,
-        &tree.tree,
+        &tree,
         comm,
         .manual,
     );
     defer shard.deinit();
 
-    tree.tree.attachShard(&shard);
-    try tree.field.fillGhosts(&tree.tree);
+    tree.attachShard(&shard);
+    try field.fillGhosts(&tree);
 
-    const ghost = tree.field.ghosts.get(block_idx).?;
+    const ghost = field.ghosts.get(block_idx).?;
     const face_idx: usize = if (rank == 0) 0 else 1;
     const expected = @as(f64, @floatFromInt((1 - rank) + 2));
     inline for (0..Nd) |link_dim| {

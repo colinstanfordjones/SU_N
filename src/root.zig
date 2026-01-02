@@ -29,13 +29,16 @@
 //! const physics = su_n.physics;
 //!
 //! const Frontend = gauge.GaugeFrontend(1, 4, 4, 16);
-//! const GaugeTree = gauge.GaugeTree(Frontend);
+//! const Tree = amr.AMRTree(Frontend);
+//! const GaugeField = gauge.GaugeField(Frontend);
 //! const FieldArena = amr.FieldArena(Frontend);
 //! const Topology = amr.topology.OpenTopology(4, .{ 1.0, 1.0, 1.0, 1.0 });
 //! const Hamiltonian = physics.hamiltonian_dirac_amr.HamiltonianDiracAMR(1, 16, Topology);
 //!
-//! var tree = try GaugeTree.init(allocator, 0.1, 4, 8);
+//! var tree = try Tree.init(allocator, 0.1, 4, 8);
 //! defer tree.deinit();
+//! var field = try GaugeField.init(allocator, &tree);
+//! defer field.deinit();
 //! _ = try tree.insertBlock(.{0, 0, 0, 0}, 0);
 //! var arena = try FieldArena.init(allocator, 16);
 //! defer arena.deinit();

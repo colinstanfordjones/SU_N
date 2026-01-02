@@ -6,7 +6,7 @@ Test organization and current guidance for the su_n library.
 
 Tests are being refactored alongside the AMR/gauge API cleanup. Physics integration tests
 that depended on legacy lattice APIs have been removed and will be rebuilt against the
-new AMR + GaugeTree interfaces.
+new AMR + GaugeField interfaces.
 
 ## Current Structure
 
@@ -75,8 +75,8 @@ See `docs/specs/amr/mpi.md` for the MPI sharding overview and ghost exchange det
 
 - Prefer API behavior checks over full pipeline simulations.
 - Use `tests/test_utils.zig` with `constants.test_epsilon` for floating-point checks.
-- New physics tests should use `gauge.GaugeTree` and `amr.GhostBuffer`, not raw AMR imports.
-- Physics kernels should implement `executeInterior`/`executeBoundary` and run via `AMRTree.apply()`.
+- New physics tests should use `gauge.GaugeField` and `amr.ApplyContext`, not raw AMR imports.
+- Physics kernels should implement `execute(block_idx, block, ctx)` and run via `AMRTree.apply()`.
 - Keep test sizes small (block_size 4 or 8) unless validating scaling.
 - Add new test files to `tests/root.zig`.
 - Non-AMR code paths have been removed; all physics uses AMR.

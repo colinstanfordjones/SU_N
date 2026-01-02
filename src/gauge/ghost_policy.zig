@@ -13,8 +13,8 @@ pub fn LinkGhostPolicy(comptime GaugeField: type) type {
     const Link = GaugeField.LinkType;
     const Nd = Tree.dimensions;
     const LinkOps = Frontend.LinkOperators;
-    const LinkArena = GaugeField.LinkArena;
-    const LinkGhostFaces = GaugeField.LinkGhostFaces;
+    const EdgeArena = GaugeField.EdgeArenaType;
+    const EdgeGhostFaces = GaugeField.EdgeGhostFaces;
 
     return struct {
         pub const Payload = Link;
@@ -22,8 +22,8 @@ pub fn LinkGhostPolicy(comptime GaugeField: type) type {
         /// Context for Link exchange
         pub const Context = struct {
             tree: *const Tree,
-            arena: *const LinkArena,
-            ghosts: []?*LinkGhostFaces,
+            arena: *const EdgeArena,
+            ghosts: []?*EdgeGhostFaces,
             slots: []const usize,
         };
         pub const ExchangeSpec = dist_exchange.ExchangeSpec(Context, Payload);

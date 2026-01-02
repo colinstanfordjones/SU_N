@@ -10,7 +10,7 @@ The gauge module (`/src/gauge/`) implements AMR-based lattice gauge infrastructu
 - Gauge groups (U(1), SU(2), SU(3)) and their algebra
 - Link variables and their operations
 - GaugeFrontend for AMR-based gauge simulations
-- GaugeTree - high-level API wrapping AMR tree with automatic link storage
+- GaugeField + AMRTree composition for link storage and mesh management
 - LinkOperators for gauge-covariant prolongation/restriction at refinement boundaries
 
 ## Design Philosophy
@@ -40,7 +40,8 @@ src/gauge/
 ├── spacetime.zig  # Minkowski metric
 ├── frontend.zig   # GaugeFrontend for AMR gauge fields
 ├── operators.zig  # LinkOperators for gauge link prolongation/restriction on AMR
-└── tree.zig       # GaugeTree - AMR tree with encapsulated link storage
+├── field.zig      # GaugeField - link storage and ghost buffers for AMRTree
+└── repartition.zig # Gauge-field-aware MPI repartition helpers
 ```
 
 ## API Reference
@@ -245,16 +246,20 @@ const U = sampler.sample();
 // Sample near-identity element (for MC updates)
 const U_near = sampler.sampleNearIdentity(epsilon);
 
-// Initialize random gauge links for a GaugeTree
+// Initialize random gauge links for a GaugeField
 const Topology = amr.PeriodicTopology(4, .{ 4.0, 4.0, 4.0, 4.0 });
 const Frontend = gauge.GaugeFrontend(2, 1, 4, 4, Topology);  // SU(2), 1 spinor, 4D, 4^4
-const GT = gauge.GaugeTree(Frontend);
+const Tree = amr.AMRTree(Frontend);
+const Field = gauge.GaugeField(Frontend);
 
-var tree = try GT.init(allocator, 1.0, 2, 8);
+var tree = try Tree.init(allocator, 1.0, 2, 8);
 defer tree.deinit();
+var field = try Field.init(allocator, &tree);
+defer field.deinit();
 _ = try tree.insertBlock(.{ 0, 0, 0, 0 }, 0);
+try field.syncWithTree(&tree);
 
-if (tree.getBlockLinksMut(0)) |links| {
+if (field.getBlockLinksMut(0)) |links| {
     for (links) |*link| {
         link.* = sampler.sample();
     }
@@ -366,9 +371,11 @@ The Frontend must provide:
 **Why in gauge module?**
 Link operators require gauge group structure (matrix logarithm for U(1) splitting, unitarization for SU(N)). The AMR module is domain-agnostic and doesn't know about gauge groups.
 
-### tree.zig - GaugeTree
+### field.zig - GaugeField
 
-High-level API for gauge theory on AMR meshes. Wraps AMR tree with automatic link storage and ghost management. Supports generic Nd >= 2 (not hardcoded to 4D) for plaquette and staple computation.
+Stateless link storage and ghost management for AMR meshes. `GaugeField` does **not**
+wrap `AMRTree`; it is attached to a tree and kept in sync after refinement, repartition,
+or reordering.
 
 ```zig
 const amr = @import("amr");
@@ -377,77 +384,70 @@ const gauge = @import("gauge");
 // Create Frontend for SU(3) Dirac spinors
 const Topology = amr.PeriodicTopology(4, .{ 16.0, 16.0, 16.0, 16.0 });
 const Frontend = gauge.GaugeFrontend(3, 4, 4, 16, Topology);  // SU(3), 4 spinor, 4D, 16^4
-const GT = gauge.GaugeTree(Frontend);
+const Tree = amr.AMRTree(Frontend);
+const Field = gauge.GaugeField(Frontend);
 
-var tree = try GT.init(allocator, 1.0, 4, 8);  // spacing=1.0, bits_per_dim=4
+var tree = try Tree.init(allocator, 1.0, 4, 8);  // spacing=1.0, bits_per_dim=4
 defer tree.deinit();
+var field = try Field.init(allocator, &tree);
+defer field.deinit();
 
-// GaugeTree exports FieldArena for matter fields
-var psi_arena = try GT.FieldArena.init(allocator, 256);
-defer psi_arena.deinit();
-
-// Insert blocks (links allocated automatically)
+// Insert blocks, then sync link storage
 _ = try tree.insertBlock(.{0, 0, 0, 0}, 0);
+try field.syncWithTree(&tree);
 
 // Access links
-const link = tree.getLink(block_idx, site, mu);
-tree.setLink(block_idx, site, mu, new_link);
+const link = field.getLink(block_idx, site, mu);
+field.setLink(block_idx, site, mu, new_link);
 
-// Fill ghost layers before cross-block operations
-try tree.fillGhosts();
-
-// Compute plaquette (ghost handling is internal)
-const plaq = tree.computePlaquette(block_idx, site, mu, nu);
+// Fill link ghost layers before cross-block operations
+try field.fillGhosts(&tree);
 ```
 
-**Type: `GaugeTree(Frontend)`**
+**Type: `GaugeField(Frontend)`**
 
-The Frontend must be a GaugeFrontend with `gauge_group_dim` and `LinkType`.
+The Frontend must be a `GaugeFrontend` with `gauge_group_dim` and `LinkType`.
 
 **Exports:**
 | Export | Description |
 |--------|-------------|
-| `FieldArena` | Re-export of `amr.FieldArena(Frontend)` |
 | `FrontendType` | The Frontend type |
 | `TreeType` | The underlying `amr.AMRTree(Frontend)` |
-| `BlockType` | The block type |
 | `LinkType` | Gauge link type |
-| `FieldType` | Field type from Frontend |
-| `N_field` | Field component count from `Frontend.field_dim` |
+| `EdgeArenaType` | Link storage arena (`amr.EdgeArena`) |
+| `EdgeGhostFaces` | Link ghost storage type |
+| `Policy` | Link ghost exchange policy (`LinkGhostPolicy`) |
 
 **Key Functions:**
 
 | Function | Description |
 |----------|-------------|
-| `init(allocator, spacing, bits_per_dim, max_level)` | Initialize tree |
-| `initWithOptions(allocator, spacing, bits_per_dim, max_level, options)` | Initialize tree with custom exchange spec |
-| `deinit()` | Clean up resources |
-| `insertBlock(origin, level)` | Insert block (links auto-allocated) |
+| `init(allocator, tree)` | Initialize link arena + ghosts for a tree |
+| `initWithOptions(allocator, tree, link_spec)` | Initialize with custom link exchange spec |
+| `syncWithTree(tree)` | Allocate links/ghosts for new blocks |
+| `reorder(perm)` | Reorder link/ghost storage after `tree.reorder()` |
 | `getLink(block_idx, site, mu)` | Get link U_mu(x) |
 | `setLink(block_idx, site, mu, link)` | Set link U_mu(x) |
-| `getBlockLinksMut(block_idx)` | Get mutable link slice (invalidates ghosts) |
-| `fillGhosts()` | Fill all ghost layers |
-| `attachShard(shard)` | Attach AMR shard context for MPI ghost exchange |
-| `detachShard()` | Detach shard context |
-| `prepareLinkGhostExchange()` | Allocate/prepare link ghosts, returns whether exchange is needed |
-| `fillGhostsPull(block_idx)` | Pull phase for link ghosts (same-level + fine<-coarse) |
-| `fillGhostsPush(block_idx)` | Push phase for link ghosts (fine->coarse) |
-| `finalizeLinkGhostExchange()` | Finalize link ghost exchange and mark valid |
-| `computePlaquette(block_idx, site, mu, nu)` | Compute plaquette with ghost handling (comptime mu, nu) |
-| `averagePlaquetteBlock(block_idx)` | Average over all Nd*(Nd-1)/2 plaquette planes |
-| `averagePlaquetteTree()` | Average plaquette across the tree |
-| `computeStaple(block_idx, site, mu)` | Sum of plaquettes containing link U_mu (for HMC) |
-| `wilsonAction(beta)` | Wilson action over the tree |
-| `covariantLaplacianSite(...)` | Gauge-covariant Laplacian at a site |
-| `applyCovariantLaplacianBlock(...)` | Gauge-covariant Laplacian over a block |
-| `reorder()` | Reorder blocks by Morton index, permuting links and ghosts |
+| `getBlockLinks(block_idx)` | Read-only link slice for a block |
+| `getBlockLinksMut(block_idx)` | Mutable link slice for a block |
+| `fillGhosts(tree)` | Fill all link ghost faces (local + MPI) |
+| `writeCheckpoint(writer)` | Append link payload after tree checkpoint |
+| `readCheckpoint(allocator, tree, reader)` | Restore links for an existing tree |
 
-**Threaded kernel execution uses `AMRTree.apply`:**
+**Threaded kernel execution uses `AMRTree.apply` + `ApplyContext`:**
 
-`GaugeTree` provides storage and ghost helpers; kernels execute through the underlying AMR tree.
+Gauge kernels execute through the underlying tree. Field ghosts are handled by
+`AMRTree.apply` when `ApplyContext.field_ghosts` is set; link ghosts must be filled
+explicitly via `GaugeField.fillGhosts`.
 
 ```zig
-try tree.tree.apply(&kernel, inputs, outputs, ghosts);
+const ApplyContext = amr.ApplyContext(Frontend);
+
+var ctx = ApplyContext.init(&tree);
+ctx.setEdges(&field.arena, &field.ghosts);
+try field.fillGhosts(&tree);
+
+try tree.apply(&kernel, &ctx);
 ```
 
 Neighbor discovery is resolved at runtime by the underlying tree (no cached neighbor arrays).
@@ -455,65 +455,38 @@ Gauge kernels should rely on ghost buffers for boundary data.
 
 The kernel must implement:
 ```zig
-fn executeInterior(self: *Self, block_idx: usize, block: *const Block, inputs: anytype, outputs: anytype, ghosts: ?*GhostBuffer) void
-fn executeBoundary(self: *Self, block_idx: usize, block: *const Block, inputs: anytype, outputs: anytype, ghosts: ?*GhostBuffer) void
+fn execute(self: *Self, block_idx: usize, block: *const Block, ctx: *ApplyContext) void
 ```
 
-If a kernel needs link ghosts, implement the optional ghost hooks by forwarding to `GaugeTree`:
-```zig
-pub fn ghostPrepare(self: *Self) !bool {
-    return try self.gauge_tree.prepareLinkGhostExchange();
-}
-pub fn ghostPull(self: *Self, block_idx: usize) void {
-    self.gauge_tree.fillGhostsPull(block_idx);
-}
-pub fn ghostPush(self: *Self, block_idx: usize) void {
-    self.gauge_tree.fillGhostsPush(block_idx);
-}
-pub fn ghostFinalize(self: *Self) void {
-    self.gauge_tree.finalizeLinkGhostExchange();
-}
-```
+**Key Pattern: Tests Use GaugeField + AMRTree**
 
-For distributed runs, attach the shard context once and let `AMRTree.apply` drive MPI ghost exchange:
-
-```zig
-var shard = try amr.ShardContext(GT.TreeType).initFromTree(allocator, &tree.tree, comm, .morton_contiguous);
-defer shard.deinit();
-
-tree.attachShard(&shard);
-try tree.tree.apply(&kernel, &arena_in, &arena_out, &ghosts);
-```
-
-**Key Pattern: Tests Use GaugeTree**
-
-For gauge-related tests, use GaugeTree and its exports rather than raw AMR imports:
+For gauge-related tests, use the gauge module types alongside AMR infrastructure:
 ```zig
 const gauge = @import("gauge");
-const GT = gauge.GaugeTree(Frontend);
-const FieldArena = GT.FieldArena;  // From GaugeTree, not amr directly
+const Field = gauge.GaugeField(Frontend);
+const FieldArena = amr.FieldArena(Frontend);
 ```
 
 **Morton Reordering:**
 
-`GaugeTree.reorder()` extends `AMRTree.reorder()` to also handle gauge-specific data:
-1. Builds permutation map before reordering the tree
-2. Permutes the links array to match new block ordering
-3. Permutes the ghosts array to match new block ordering
-4. Calls the underlying `AMRTree.reorder()`
-5. Invalidates the ghost cache (`ghosts_valid = false`)
+After mesh adaptation or repartition:
+1. Call `tree.reorder()` to get the permutation map.
+2. Call `field.reorder(perm)` to remap link storage.
+3. Call `field.ghosts.invalidateAll()` or `field.fillGhosts(&tree)` before boundary reads.
 
 Call after mesh adaptation when `AdaptResult.changed` is true:
 ```zig
 const result = try adaptation.adaptMesh(...);
 if (result.changed) {
-    try gaugeTree.reorder();
+    const perm = try tree.reorder();
+    defer tree.allocator.free(perm);
+    try field.reorder(perm);
 }
 ```
 
 **Warning:** This invalidates all external pointers to blocks, field data, and link slices.
 
-Reference: `src/gauge/tree.zig` for implementation.
+Reference: `src/gauge/field.zig` for implementation.
 
 ### spacetime.zig - Minkowski Geometry
 
@@ -544,7 +517,7 @@ const sum = p.add(q);
 
 ## Usage Examples
 
-### Creating a GaugeTree
+### Creating a GaugeField + Tree
 
 ```zig
 const amr = @import("amr");
@@ -552,15 +525,19 @@ const gauge = @import("gauge");
 
 const Topology = amr.PeriodicTopology(4, .{ 8.0, 8.0, 8.0, 8.0 });
 const Frontend = gauge.GaugeFrontend(2, 1, 4, 8, Topology);  // SU(2), 1 spinor, 4D, 8^4
-const GT = gauge.GaugeTree(Frontend);
+const Tree = amr.AMRTree(Frontend);
+const Field = gauge.GaugeField(Frontend);
 
-var tree = try GT.init(allocator, 1.0, 3, 8);
+var tree = try Tree.init(allocator, 1.0, 3, 8);
 defer tree.deinit();
+var field = try Field.init(allocator, &tree);
+defer field.deinit();
 _ = try tree.insertBlock(.{ 0, 0, 0, 0 }, 0);
+try field.syncWithTree(&tree);
 
 // Set a specific link
 const U = gauge.link.LinkVariable(2).fromGenerator(0.1, gauge.su2.Su2.sigma3());
-tree.setLink(0, site, mu, U);
+field.setLink(0, site, mu, U);
 ```
 
 ### Computing Wilson Action
@@ -571,24 +548,29 @@ const gauge = @import("gauge");
 
 const Topology = amr.PeriodicTopology(4, .{ 8.0, 8.0, 8.0, 8.0 });
 const Frontend = gauge.GaugeFrontend(3, 1, 4, 8, Topology);  // SU(3), 1 spinor, 4D, 8^4
-const GT = gauge.GaugeTree(Frontend);
+const Tree = amr.AMRTree(Frontend);
+const Field = gauge.GaugeField(Frontend);
+const LinkOps = gauge.LinkOperators(Frontend);
 const beta = 6.0;  // β = 2N/g² for SU(3)
 
-var tree = try GT.init(allocator, 1.0, 3, 8);
+var tree = try Tree.init(allocator, 1.0, 3, 8);
 defer tree.deinit();
+var field = try Field.init(allocator, &tree);
+defer field.deinit();
 _ = try tree.insertBlock(.{ 0, 0, 0, 0 }, 0);
+try field.syncWithTree(&tree);
 
 // Initialize links with Haar samples
 var sampler = gauge.haar.HaarSampler(3).init(12345);
-if (tree.getBlockLinksMut(0)) |links| {
+if (field.getBlockLinksMut(0)) |links| {
     for (links) |*link| {
         link.* = sampler.sample();
     }
 }
 
-try tree.fillGhosts();
-const action = tree.wilsonAction(beta);
-const avg_plaq = tree.averagePlaquetteTree();
+try field.fillGhosts(&tree);
+const action = LinkOps.wilsonAction(&tree, &field, beta);
+const avg_plaq = LinkOps.averagePlaquetteTree(&tree, &field);
 ```
 
 ### Gauge-Covariant Laplacian
@@ -599,34 +581,40 @@ const gauge = @import("gauge");
 
 const Topology = amr.PeriodicTopology(4, .{ 8.0, 8.0, 8.0, 8.0 });
 const Frontend = gauge.GaugeFrontend(1, 1, 4, 8, Topology);  // U(1), 1 spinor, 4D, 8^4
-const GT = gauge.GaugeTree(Frontend);
+const Tree = amr.AMRTree(Frontend);
+const Field = gauge.GaugeField(Frontend);
+const LinkOps = gauge.LinkOperators(Frontend);
 const Ghosts = amr.GhostBuffer(Frontend);
 
-var tree = try GT.init(allocator, 1.0, 3, 8);
+var tree = try Tree.init(allocator, 1.0, 3, 8);
 defer tree.deinit();
+var field = try Field.init(allocator, &tree);
+defer field.deinit();
 
-var arena = try GT.FieldArena.init(allocator, 16);
+var arena = try amr.FieldArena(Frontend).init(allocator, 16);
 defer arena.deinit();
 _ = try tree.insertBlockWithField(.{ 0, 0, 0, 0 }, 0, &arena);
+try field.syncWithTree(&tree);
 
 var ghosts = try Ghosts.init(allocator, 16);
 defer ghosts.deinit();
-try ghosts.ensureForTree(&tree.tree);
-amr.ghost.fillGhostLayers(@TypeOf(tree.tree), &tree.tree, &arena, ghosts.slice(tree.tree.blocks.items.len));
+try ghosts.ensureForTree(&tree);
+try tree.fillGhostLayers(&arena, ghosts.slice(tree.blocks.items.len));
 
-try tree.fillGhosts(); // Link ghosts for backward transport
+try field.fillGhosts(&tree); // Link ghosts for backward transport
 
-const slot = tree.tree.getFieldSlot(0);
+const slot = tree.getFieldSlot(0);
 const psi = arena.getSlot(slot);
 
 if (ghosts.get(0)) |ghost_faces| {
-    var ghost_slices: [GT.num_faces][]const Frontend.FieldType = undefined;
-    for (0..GT.num_faces) |face| {
+    const Nd = Frontend.Nd;
+    var ghost_slices: [2 * Nd][]const Frontend.FieldType = undefined;
+    for (0..2 * Nd) |face| {
         ghost_slices[face] = ghost_faces[face][0..];
     }
 
-    const spacing = tree.tree.blocks.items[0].spacing;
-    const lap = tree.covariantLaplacianSite(0, site, psi, ghost_slices, spacing);
+    const spacing = tree.blocks.items[0].spacing;
+    const lap = LinkOps.covariantLaplacianSite(&tree, &field, 0, site, psi, ghost_slices, spacing);
     _ = lap;
 }
 ```
@@ -656,8 +644,9 @@ link.zig (uses math, defines LinkVariable(N))
     ↓
 haar.zig (HaarSampler, uses link)
 frontend.zig (GaugeFrontend, uses link, validates as AMR Frontend)
-operators.zig (LinkOperators, uses link for gauge-covariant prolongation)
-tree.zig (GaugeTree, wraps AMR tree with link storage + plaquettes + covariant Laplacian)
+operators.zig (LinkOperators, uses link for gauge-covariant prolongation + plaquettes)
+field.zig (GaugeField, link storage + ghost buffers for AMRTree)
+repartition.zig (MPI repartition helpers for gauge links)
     ↓
 physics modules (hamiltonian_amr.zig, hamiltonian_dirac_amr.zig, force_amr.zig)
 ```

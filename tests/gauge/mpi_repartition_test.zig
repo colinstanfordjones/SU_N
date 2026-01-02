@@ -18,13 +18,16 @@ test "mpi gauge repartition migrates links" {
     const block_size = 4;
     const Topology = amr.topology.OpenTopology(2, .{ 64.0, 4.0 });
     const Frontend = gauge.GaugeFrontend(1, 1, 2, block_size, Topology);
-    const GaugeTree = gauge.GaugeTree(Frontend);
-    const Arena = GaugeTree.FieldArena;
+    const Tree = amr.AMRTree(Frontend);
+    const GaugeField = gauge.GaugeField(Frontend);
+    const Arena = amr.FieldArena(Frontend);
     const Link = Frontend.LinkType;
     const Complex = std.math.Complex(f64);
 
-    var tree = try GaugeTree.init(std.testing.allocator, 1.0, 4, 8);
+    var tree = try Tree.init(std.testing.allocator, 1.0, 4, 8);
     defer tree.deinit();
+    var field = try GaugeField.init(std.testing.allocator, &tree);
+    defer field.deinit();
 
     var arena = try Arena.init(std.testing.allocator, 8);
     defer arena.deinit();
@@ -39,9 +42,11 @@ test "mpi gauge repartition migrates links" {
         _ = try tree.insertBlockWithField(origins[3], 0, &arena);
     }
 
-    for (tree.tree.blocks.items, 0..) |*block, idx| {
+    try field.syncWithTree(&tree);
+
+    for (tree.blocks.items, 0..) |*block, idx| {
         if (block.block_index == std.math.maxInt(usize)) continue;
-        const slot = tree.tree.getFieldSlot(idx);
+        const slot = tree.getFieldSlot(idx);
         const field_slice = arena.getSlot(slot);
         for (field_slice) |*value| {
             value.*[0] = Complex.init(1.0, 0.0);
@@ -50,30 +55,30 @@ test "mpi gauge repartition migrates links" {
         const link_value = @as(f64, @floatFromInt(block.origin[0] / block_size + 2));
         var link = Link.identity();
         link.matrix.data[0][0] = Complex.init(link_value, 0.0);
-        if (tree.getBlockLinksMut(idx)) |links| {
+        if (field.getBlockLinksMut(idx)) |links| {
             for (links) |*l| l.* = link;
         }
     }
 
-    var shard = try amr.ShardContext(GaugeTree.TreeType).initFromTree(
+    var shard = try amr.ShardContext(Tree).initFromTree(
         std.testing.allocator,
-        &tree.tree,
+        &tree,
         comm,
         .manual,
     );
     defer shard.deinit();
 
-    tree.tree.attachShard(&shard);
+    tree.attachShard(&shard);
 
-    try gauge.repartition.repartitionEntropyWeighted(GaugeTree, &tree, &arena, &shard, .{});
+    try gauge.repartition.repartitionEntropyWeighted(Frontend, &tree, &field, &arena, &shard, .{});
 
     try std.testing.expectEqual(@as(usize, 2), tree.blockCount());
     try std.testing.expectEqual(@as(usize, 2), shard.localBlockIndices().len);
 
     for (shard.localBlockIndices()) |block_idx| {
-        const block = tree.tree.getBlock(block_idx).?;
+        const block = tree.getBlock(block_idx).?;
         const expected = @as(f64, @floatFromInt(block.origin[0] / block_size + 2));
-        const links = tree.getBlockLinksConst(block_idx).?;
+        const links = field.getBlockLinks(block_idx).?;
         try std.testing.expectApproxEqAbs(
             expected,
             links[0].matrix.data[0][0].re,

@@ -8,47 +8,57 @@ const ghost_policy = gauge.ghost_policy;
 test "gauge ghost normal link matches neighbor" {
     const Topology = amr.topology.OpenTopology(2, .{ 16.0, 16.0 });
     const Frontend = gauge.GaugeFrontend(1, 1, 2, 4, Topology);
-    const GaugeTree = gauge.GaugeTree(Frontend);
-    const Block = GaugeTree.BlockType;
+    const Tree = amr.AMRTree(Frontend);
+    const GaugeField = gauge.GaugeField(Frontend);
+    const Block = Tree.BlockType;
     const Link = Frontend.LinkType;
     const Complex = std.math.Complex(f64);
 
-    var tree = try GaugeTree.init(std.testing.allocator, 1.0, 4, 4);
+    var tree = try Tree.init(std.testing.allocator, 1.0, 4, 4);
     defer tree.deinit();
+    var field = try GaugeField.init(std.testing.allocator, &tree);
+    defer field.deinit();
 
     const left_idx = try tree.insertBlock(.{ 0, 0 }, 0);
     const right_idx = try tree.insertBlock(.{ Block.size, 0 }, 0);
+    try field.syncWithTree(&tree);
 
     var link = Link.identity();
     link.matrix.data[0][0] = Complex.init(3.0, 0);
-    if (tree.getBlockLinksMut(right_idx)) |links| {
+    if (field.getBlockLinksMut(right_idx)) |links| {
         for (links) |*l| l.* = link;
     }
 
-    try tree.fillGhosts();
+    try field.fillGhosts(&tree);
 
     const face_idx: usize = 0; // +x face
     const ghost_idx: usize = 0;
-    const ghost_link = tree.getGhostLink(left_idx, face_idx, 0, ghost_idx);
+    const ghost = field.ghosts.get(left_idx).?;
+    const ghost_slice = ghost.get(face_idx, 0);
+    try std.testing.expect(ghost_slice.len > ghost_idx);
+    const ghost_link = ghost_slice[ghost_idx];
     try std.testing.expectApproxEqAbs(3.0, ghost_link.matrix.data[0][0].re, constants.test_epsilon);
 }
 
 test "gauge ghost fine-to-coarse does not accumulate" {
     const Topology = amr.topology.OpenTopology(2, .{ 16.0, 16.0 });
     const Frontend = gauge.GaugeFrontend(1, 1, 2, 4, Topology);
-    const GaugeTree = gauge.GaugeTree(Frontend);
+    const Tree = amr.AMRTree(Frontend);
+    const GaugeField = gauge.GaugeField(Frontend);
     const Link = Frontend.LinkType;
     const Complex = std.math.Complex(f64);
 
-    var tree = try GaugeTree.init(std.testing.allocator, 1.0, 4, 4);
+    var tree = try Tree.init(std.testing.allocator, 1.0, 4, 4);
     defer tree.deinit();
+    var field = try GaugeField.init(std.testing.allocator, &tree);
+    defer field.deinit();
 
     const coarse_idx = try tree.insertBlock(.{ 0, 0 }, 0);
-    const coarse_block = tree.tree.getBlock(coarse_idx).?;
+    const coarse_block = tree.getBlock(coarse_idx).?;
 
-    var neighbor_physical = tree.tree.getPhysicalOrigin(coarse_block);
-    neighbor_physical[0] += tree.tree.getBlockPhysicalExtent(coarse_block.level);
-    const fine_origin_base = tree.tree.physicalToBlockOrigin(neighbor_physical, coarse_block.level + 1);
+    var neighbor_physical = tree.getPhysicalOrigin(coarse_block);
+    neighbor_physical[0] += tree.getBlockPhysicalExtent(coarse_block.level);
+    const fine_origin_base = tree.physicalToBlockOrigin(neighbor_physical, coarse_block.level + 1);
 
     const face_dim: usize = 0;
     const fine_count = @as(usize, 1) << @intCast(Frontend.Nd - 1);
@@ -65,17 +75,18 @@ test "gauge ghost fine-to-coarse does not accumulate" {
         _ = try tree.insertBlock(origin, coarse_block.level + 1);
     }
 
+    try field.syncWithTree(&tree);
     for (0..tree.blockCount()) |idx| {
         if (idx == coarse_idx) continue;
-        const links = tree.getBlockLinksMut(idx).?;
+        const links = field.getBlockLinksMut(idx).?;
         var link = Link.identity();
         link.matrix.data[0][0] = Complex.init(@as(f64, @floatFromInt(idx + 1)), 0);
         for (links) |*l| l.* = link;
     }
 
-    try tree.fillGhosts();
+    try field.fillGhosts(&tree);
 
-    const ghost = tree.field.ghosts.get(coarse_idx).?;
+    const ghost = field.ghosts.get(coarse_idx).?;
     const face_idx: usize = 0; // +x face
     const link_dim: usize = 1; // tangential direction
     const ghost_slice = ghost.get(face_idx, link_dim);
@@ -85,10 +96,10 @@ test "gauge ghost fine-to-coarse does not accumulate" {
     defer std.testing.allocator.free(snapshot);
     @memcpy(snapshot, ghost_slice);
 
-    if (tree.getBlockLinksMut(coarse_idx)) |links| {
+    if (field.getBlockLinksMut(coarse_idx)) |links| {
         links[0] = links[0];
     }
-    try tree.fillGhosts();
+    try field.fillGhosts(&tree);
 
     const refreshed = ghost.get(face_idx, link_dim);
     for (refreshed, 0..) |val, i| {
@@ -103,8 +114,9 @@ test "gauge ghost fine-to-coarse does not accumulate" {
 test "gauge ghost exchange uses custom spec for local fills" {
     const Topology = amr.topology.OpenTopology(2, .{ 16.0, 16.0 });
     const Frontend = gauge.GaugeFrontend(1, 1, 2, 4, Topology);
-    const GaugeTree = gauge.GaugeTree(Frontend);
-    const Policy = ghost_policy.LinkGhostPolicy(GaugeTree.GaugeFieldType);
+    const Tree = amr.AMRTree(Frontend);
+    const GaugeField = gauge.GaugeField(Frontend);
+    const Policy = ghost_policy.LinkGhostPolicy(GaugeField);
     const Context = Policy.Context;
     const Payload = Policy.Payload;
     const Link = Frontend.LinkType;
@@ -121,23 +133,23 @@ test "gauge ghost exchange uses custom spec for local fills" {
     var spec = Policy.exchangeSpec();
     spec.pack_same_level = packSame;
 
-    var tree = try GaugeTree.initWithOptions(
-        std.testing.allocator,
-        1.0,
-        4,
-        4,
-        .{ .link_exchange_spec = spec },
-    );
+    var tree = try Tree.init(std.testing.allocator, 1.0, 4, 4);
     defer tree.deinit();
+    var field = try GaugeField.initWithOptions(std.testing.allocator, &tree, spec);
+    defer field.deinit();
 
     const left_idx = try tree.insertBlock(.{ 0, 0 }, 0);
     _ = try tree.insertBlock(.{ Frontend.block_size, 0 }, 0);
 
-    try tree.fillGhosts();
+    try field.syncWithTree(&tree);
+    try field.fillGhosts(&tree);
 
     const face_idx: usize = 0; // +x face
     inline for (0..Frontend.Nd) |link_dim| {
-        const ghost_link = tree.getGhostLink(left_idx, face_idx, link_dim, 0);
+        const ghost = field.ghosts.get(left_idx).?;
+        const ghost_slice = ghost.get(face_idx, link_dim);
+        try std.testing.expect(ghost_slice.len > 0);
+        const ghost_link = ghost_slice[0];
         try std.testing.expectApproxEqAbs(7.0, ghost_link.matrix.data[0][0].re, constants.test_epsilon);
     }
 }
